@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ALGLORY // BOT FACTORY</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="wordmark">ALGLORY<span class="blink">_</span></div>
+  <nav class="tabs">
+    <a href="#deck" data-tab="deck" class="tab active">DECK</a>
+    <a href="#control" data-tab="control" class="tab">CONTROL</a>
+    <a href="#vault" data-tab="vault" class="tab">VAULT</a>
+    <a href="#map" data-tab="map" class="tab">MAP</a>
+    <a href="#insights" data-tab="insights" class="tab">INSIGHTS</a>
+  </nav>
+  <div class="topbar-right">
+    <button id="fx-toggle" class="pill" title="visual effects quality">FX: FULL</button>
+    <span id="mt5-pill" class="pill pill-warn" title="">MT5: ...</span>
+  </div>
+</header>
+
+<main>
+  <section id="tab-deck" class="tab-panel active">
+    <div class="deck-grid">
+      <div class="panel deck-canvas-wrap">
+        <div class="panel-title">EVOLUTION CORE</div>
+        <canvas id="deck-canvas"></canvas>
+      </div>
+      <aside class="deck-side">
+        <div class="panel stats-panel">
+          <div class="panel-title">CAMPAIGN TELEMETRY</div>
+          <dl class="stats" id="deck-stats">
+            <div><dt>STATE</dt><dd id="st-state">IDLE</dd></div>
+            <div><dt>GEN</dt><dd id="st-gen">-</dd></div>
+            <div><dt>TRIBE</dt><dd id="st-tribe">-</dd></div>
+            <div><dt>SURVIVORS</dt><dd id="st-survivors">-</dd></div>
+            <div><dt>TOP FITNESS</dt><dd id="st-fitness">-</dd></div>
+            <div><dt>VAULTED</dt><dd id="st-vaulted">0</dd></div>
+            <div><dt>ELAPSED</dt><dd id="st-elapsed">-</dd></div>
+            <div><dt>ETA</dt><dd id="st-eta">-</dd></div>
+          </dl>
+        </div>
+        <div class="panel">
+          <div class="panel-title">GENERATION LEADERS</div>
+          <canvas id="equity-canvas" height="140"></canvas>
+        </div>
+        <div class="panel terminal-panel">
+          <div class="panel-title">ENGINE LOG</div>
+          <pre id="deck-terminal" class="terminal"></pre>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <section id="tab-control" class="tab-panel">
+    <div class="panel control-panel">
+      <div class="panel-title">CAMPAIGN CONTROL</div>
+      <form id="campaign-form" class="control-form">
+        <label>SYMBOLS <input type="text" name="symbols" value="EURUSD" title="comma-separated"></label>
+        <label>TIMEFRAME
+          <select name="timeframe">
+            <option>M15</option><option selected>H1</option><option>H4</option><option>D1</option>
+          </select>
+        </label>
+        <label>DATA SOURCE
+          <select name="source">
+            <option value="sample" selected>SAMPLE (synthetic)</option>
+            <option value="mt5">MT5 TERMINAL</option>
+          </select>
+        </label>
+        <fieldset class="tribes-fs"><legend>TRIBES</legend>
+          <label><input type="checkbox" name="tribes" value="trend" checked> TREND</label>
+          <label><input type="checkbox" name="tribes" value="breakout" checked> BREAKOUT</label>
+          <label><input type="checkbox" name="tribes" value="mean_reversion" checked> MEAN REVERSION</label>
+          <label><input type="checkbox" name="tribes" value="momentum" checked> MOMENTUM</label>
+        </fieldset>
+        <label>POWER (population) <span class="range-val" id="pop-val">40</span>
+          <input type="range" name="population" min="8" max="200" value="40"
+                 oninput="document.getElementById('pop-val').textContent=this.value">
+        </label>
+        <label>GENERATIONS <span class="range-val" id="gen-val">15</span>
+          <input type="range" name="generations" min="2" max="60" value="15"
+                 oninput="document.getElementById('gen-val').textContent=this.value">
+        </label>
+        <label>OOS FRACTION <span class="range-val" id="oos-val">0.25</span>
+          <input type="range" name="oos_fraction" min="0.1" max="0.5" step="0.05" value="0.25"
+                 oninput="document.getElementById('oos-val').textContent=this.value">
+        </label>
+        <label>MIN TRADES <input type="number" name="min_trades" value="30" min="1"></label>
+        <label>DD CAP <input type="number" name="dd_cap" value="0.35" min="0.05" max="1" step="0.05"></label>
+        <label>SEED (blank = random) <input type="number" name="seed" placeholder="random"></label>
+        <div class="control-actions">
+          <button type="submit" id="launch-btn" class="btn-primary">▶ LAUNCH CAMPAIGN</button>
+          <button type="button" id="cancel-btn" class="btn-danger" disabled>■ CANCEL</button>
+        </div>
+      </form>
+      <div id="control-error" class="error-box" hidden></div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">LIVE FEED</div>
+      <pre id="control-terminal" class="terminal terminal-tall"></pre>
+    </div>
+  </section>
+
+  <section id="tab-vault" class="tab-panel">
+    <div class="panel">
+      <div class="panel-title">STRATEGY VAULT</div>
+      <div class="filter-bar">
+        <input type="text" id="vf-symbol" placeholder="SYMBOL">
+        <select id="vf-tribe">
+          <option value="">ALL TRIBES</option>
+          <option value="trend">TREND</option>
+          <option value="breakout">BREAKOUT</option>
+          <option value="mean_reversion">MEAN REVERSION</option>
+          <option value="momentum">MOMENTUM</option>
+        </select>
+        <select id="vf-sort">
+          <option value="oos_net_profit">OOS PROFIT</option>
+          <option value="oos_profit_factor">OOS PF</option>
+          <option value="oos_sharpe">OOS SHARPE</option>
+          <option value="oos_max_drawdown">OOS DD</option>
+          <option value="created_at">NEWEST</option>
+        </select>
+        <button id="vf-apply" class="pill">FILTER</button>
+      </div>
+      <table class="vault-table" id="vault-table">
+        <thead><tr>
+          <th>NAME</th><th>TRIBE</th><th>SYMBOL</th><th>TF</th>
+          <th>OOS PROFIT</th><th>PF</th><th>DD</th><th>SHARPE</th><th>TRADES</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+      <div id="vault-empty" class="empty-note" hidden>VAULT EMPTY - RUN A CAMPAIGN FROM THE CONTROL TAB.</div>
+    </div>
+    <div class="panel" id="vault-detail" hidden>
+      <div class="panel-title">STRATEGY DETAIL <button id="detail-close" class="pill">✕</button></div>
+      <div id="detail-body"></div>
+    </div>
+  </section>
+
+  <section id="tab-map" class="tab-panel">
+    <div class="panel map-panel">
+      <div class="panel-title">VAULT GALAXY
+        <span class="map-hint">scroll = zoom · drag = pan · click cluster = inspect</span>
+      </div>
+      <canvas id="map-canvas"></canvas>
+      <div id="map-callout" class="map-callout" hidden></div>
+    </div>
+  </section>
+
+  <section id="tab-insights" class="tab-panel">
+    <div class="panel">
+      <div class="panel-title">VAULT INSIGHTS</div>
+      <div class="insights-grid">
+        <div><h3>BY SYMBOL</h3><canvas id="ins-symbol" height="180"></canvas></div>
+        <div><h3>BY TIMEFRAME</h3><canvas id="ins-timeframe" height="180"></canvas></div>
+        <div><h3>BY TRIBE</h3><canvas id="ins-tribe" height="180"></canvas></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="disclaimer">
+  ALGLORY is strategy research software, not financial advice. Trading leveraged products
+  carries a high risk of loss; backtested results do not predict future performance.
+  You may lose more than your initial deposit.
+</footer>
+
+<div id="toast" class="toast" hidden></div>
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>
