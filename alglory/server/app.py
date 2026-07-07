@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -28,7 +29,29 @@ class DeployRequest(BaseModel):
 
 
 def create_app(cfg: AppConfig) -> FastAPI:
-    app = FastAPI(title="Alglory", version="0.1.0")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Single drainer: keeps the worker's event queue flowing even with no
+        # browser attached (a full pipe would block the worker's exit), and
+        # broadcasts every event to all connected sockets.
+        async def pump():
+            while True:
+                for event in app.state.manager.drain():
+                    dead = []
+                    for sock in app.state.sockets:
+                        try:
+                            await sock.send_json(event)
+                        except Exception:
+                            dead.append(sock)
+                    for sock in dead:
+                        app.state.sockets.discard(sock)
+                await asyncio.sleep(POLL_INTERVAL)
+
+        task = asyncio.create_task(pump())
+        yield
+        task.cancel()
+
+    app = FastAPI(title="Alglory", version="0.1.0", lifespan=lifespan)
     app.state.cfg = cfg
     app.state.manager = CampaignManager(cfg.db_path, cfg.data_dir)
     app.state.sockets = set()
@@ -173,21 +196,9 @@ def create_app(cfg: AppConfig) -> FastAPI:
         app.state.sockets.add(ws)
         try:
             while True:
-                events = manager.drain()
-                for event in events:
-                    dead = []
-                    for sock in app.state.sockets:
-                        try:
-                            await sock.send_json(event)
-                        except Exception:
-                            dead.append(sock)
-                    for sock in dead:
-                        app.state.sockets.discard(sock)
-                # keep the connection alive; receive with timeout to notice closes
-                try:
-                    await asyncio.wait_for(ws.receive_text(), timeout=POLL_INTERVAL)
-                except asyncio.TimeoutError:
-                    pass
+                # broadcasting happens in the lifespan pump; this loop only
+                # keeps the connection open and notices client closes
+                await ws.receive_text()
         except (WebSocketDisconnect, RuntimeError):
             app.state.sockets.discard(ws)
 
