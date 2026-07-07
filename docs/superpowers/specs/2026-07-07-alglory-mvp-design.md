@@ -81,7 +81,9 @@ Genomes serialize to/from JSON (vault storage, EA codegen input).
   profit factor, Sharpe (annualized), win rate, trade count.
 - Correctness is test-pinned with small hand-computed fixtures.
 
-### 4. `alglory/evolve` — genetic engine (DEAP)
+### 4. `alglory/evolve` — genetic engine
+- Custom tournament GA (DEAP was considered but its list-based individuals fit
+  structured, tribe-constrained genomes poorly; the custom loop is less code).
 - Per-tribe subpopulations; tournament selection, uniform + parameter-Gaussian
   mutation, single-point crossover on gene groups, elitism.
 - **Fitness** computed on the in-sample window only:
