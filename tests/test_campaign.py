@@ -88,7 +88,16 @@ def test_campaign_cancellation(vault, cache):
     assert row["status"] == "cancelled"
 
 
-def test_campaign_mt5_unavailable_fails_clearly(vault, cache):
+def test_campaign_mt5_unavailable_fails_clearly(vault, cache, monkeypatch):
+    # Hermetic: force the unavailable path even on machines where the
+    # MetaTrader5 package and a live terminal are actually present.
+    from alglory.data.mt5source import ConnStatus, MT5Source
+
+    monkeypatch.setattr(
+        MT5Source,
+        "connect",
+        lambda self: ConnStatus(ok=False, message="MetaTrader5 unavailable (test)"),
+    )
     cfg = dict(TINY, source="mt5")
     events = _run(cfg, vault, cache)
     finished = events[-1]
