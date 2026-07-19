@@ -107,6 +107,48 @@ def test_campaign_mt5_unavailable_fails_clearly(vault, cache, monkeypatch):
     assert row["status"] == "failed"
 
 
+def test_campaign_pause_blocks_then_resumes(vault, cache):
+    events = []
+    # report "paused" for the first few polls, then let the campaign run on
+    pause_polls = {"n": 0}
+
+    def should_pause():
+        pause_polls["n"] += 1
+        return pause_polls["n"] <= 3
+
+    run_campaign(
+        CampaignConfig(**TINY),
+        vault,
+        cache,
+        emit=events.append,
+        should_stop=lambda: False,
+        should_pause=should_pause,
+    )
+    lines = [e["line"] for e in events if e["type"] == "log"]
+    assert any("paused" in line for line in lines)
+    assert any("resumed" in line for line in lines)
+    assert events[-1]["status"] == "done"
+
+
+def test_campaign_cancel_while_paused(vault, cache):
+    events = []
+    stop = {"now": False}
+
+    def should_pause():
+        stop["now"] = True  # cancel arrives while paused
+        return True
+
+    run_campaign(
+        CampaignConfig(**TINY),
+        vault,
+        cache,
+        emit=events.append,
+        should_stop=lambda: stop["now"],
+        should_pause=should_pause,
+    )
+    assert events[-1]["status"] == "cancelled"
+
+
 def test_campaign_config_validation():
     with pytest.raises(Exception):
         CampaignConfig(symbols=[], timeframe="H1", tribes=["trend"])

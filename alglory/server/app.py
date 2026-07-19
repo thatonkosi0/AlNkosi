@@ -73,6 +73,7 @@ def create_app(cfg: AppConfig) -> FastAPI:
             "vault_count": vault().count(),
             "campaign": {
                 "running": manager.is_running(),
+                "paused": manager.is_paused(),
                 "campaign_id": manager.current_campaign_id,
             },
         }
@@ -96,9 +97,32 @@ def create_app(cfg: AppConfig) -> FastAPI:
         manager.stop()
         return {"status": "cancelling"}
 
+    @app.post("/api/campaigns/pause")
+    def pause_campaign():
+        manager = app.state.manager
+        if not manager.is_running():
+            raise HTTPException(409, "No campaign is running.")
+        manager.pause()
+        return {"status": "pausing"}
+
+    @app.post("/api/campaigns/resume")
+    def resume_campaign():
+        manager = app.state.manager
+        if not manager.is_running():
+            raise HTTPException(409, "No campaign is running.")
+        manager.resume()
+        return {"status": "resuming"}
+
     @app.get("/api/campaigns")
     def list_campaigns():
         return vault().list_campaigns()
+
+    @app.get("/api/campaigns/{cid}")
+    def get_campaign(cid: int):
+        row = vault().get_campaign(cid)
+        if row is None:
+            raise HTTPException(404, f"Campaign {cid} not found.")
+        return row
 
     @app.get("/api/vault")
     def vault_list(

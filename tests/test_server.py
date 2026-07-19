@@ -15,6 +15,7 @@ class FakeManager:
         self.running = False
         self.started_with = None
         self.stopped = False
+        self.paused = False
         self.current_campaign_id = None
         self.last_events = []
 
@@ -29,6 +30,15 @@ class FakeManager:
 
     def stop(self):
         self.stopped = True
+
+    def pause(self):
+        self.paused = True
+
+    def resume(self):
+        self.paused = False
+
+    def is_paused(self):
+        return self.paused
 
     def drain(self):
         return []
@@ -92,6 +102,38 @@ def test_campaign_cancel(app_client):
     r = client.post("/api/campaigns/cancel")
     assert r.status_code == 200
     assert fake.stopped is True
+
+
+def test_campaign_pause_and_resume(app_client):
+    client, fake, cfg = app_client
+    # not running -> 409
+    assert client.post("/api/campaigns/pause").status_code == 409
+    assert client.post("/api/campaigns/resume").status_code == 409
+    fake.running = True
+    assert client.post("/api/campaigns/pause").status_code == 200
+    assert fake.paused is True
+    status = client.get("/api/status").json()
+    assert status["campaign"]["paused"] is True
+    assert client.post("/api/campaigns/resume").status_code == 200
+    assert fake.paused is False
+
+
+def test_campaign_get_by_id(app_client):
+    client, fake, cfg = app_client
+    cid = Vault(cfg.db_path).create_campaign('{"symbols": ["EURUSD"]}')
+    body = client.get(f"/api/campaigns/{cid}").json()
+    assert body["id"] == cid
+    assert client.get("/api/campaigns/424242").status_code == 404
+
+
+def test_campaign_accepts_commission(app_client):
+    client, fake, cfg = app_client
+    payload = {
+        "symbols": ["EURUSD"], "tribes": ["trend"], "population": 8,
+        "generations": 2, "commission_per_lot": 0.00007,
+    }
+    assert client.post("/api/campaigns", json=payload).status_code == 202
+    assert fake.started_with.commission_per_lot == pytest.approx(0.00007)
 
 
 def test_vault_list_get_delete(app_client):

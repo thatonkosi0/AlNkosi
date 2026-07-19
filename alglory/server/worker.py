@@ -17,7 +17,7 @@ from alglory.evolve.campaign import CampaignConfig, run_campaign
 from alglory.vault.db import Vault
 
 
-def _worker_main(cfg_json: str, db_path: str, data_dir: str, q, stop_event) -> None:
+def _worker_main(cfg_json: str, db_path: str, data_dir: str, q, stop_event, pause_event) -> None:
     cfg = CampaignConfig.model_validate_json(cfg_json)
     vault = Vault(Path(db_path))
     cache = BarCache(Path(data_dir))
@@ -27,6 +27,7 @@ def _worker_main(cfg_json: str, db_path: str, data_dir: str, q, stop_event) -> N
         cache,
         emit=q.put,
         should_stop=stop_event.is_set,
+        should_pause=pause_event.is_set,
     )
 
 
@@ -42,6 +43,7 @@ class CampaignManager:
         self._proc: mp.Process | None = None
         self._queue = None
         self._stop_event = None
+        self._pause_event = None
         self.current_campaign_id: int | None = None
         self.last_events: list[dict] = []
 
@@ -53,6 +55,7 @@ class CampaignManager:
             raise BusyError("A campaign is already running; cancel it first.")
         self._queue = self._ctx.Queue()
         self._stop_event = self._ctx.Event()
+        self._pause_event = self._ctx.Event()
         self.current_campaign_id = None
         self._proc = self._ctx.Process(
             target=_worker_main,
@@ -62,6 +65,7 @@ class CampaignManager:
                 self._data_dir,
                 self._queue,
                 self._stop_event,
+                self._pause_event,
             ),
             daemon=True,
         )
@@ -70,6 +74,19 @@ class CampaignManager:
     def stop(self) -> None:
         if self._stop_event is not None:
             self._stop_event.set()
+        if self._pause_event is not None:
+            self._pause_event.clear()  # a paused campaign must still cancel
+
+    def pause(self) -> None:
+        if self._pause_event is not None:
+            self._pause_event.set()
+
+    def resume(self) -> None:
+        if self._pause_event is not None:
+            self._pause_event.clear()
+
+    def is_paused(self) -> bool:
+        return self._pause_event is not None and self._pause_event.is_set()
 
     def drain(self) -> list[dict]:
         """Pull all pending events from the worker (non-blocking)."""

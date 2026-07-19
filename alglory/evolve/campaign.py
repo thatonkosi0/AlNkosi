@@ -41,6 +41,7 @@ class CampaignConfig(BaseModel):
     source: str = "sample"
     min_trades: int = Field(default=30, ge=1)
     dd_cap: float = Field(default=0.35, gt=0.0, le=1.0)
+    commission_per_lot: float = Field(default=0.0, ge=0.0)
 
     @field_validator("timeframe")
     @classmethod
@@ -88,12 +89,28 @@ def _load_bars(cfg: CampaignConfig, symbol: str, cache: BarCache, emit):
     return bars
 
 
+def _wait_while_paused(
+    should_pause: Callable[[], bool] | None,
+    should_stop: Callable[[], bool],
+    emit: Callable[[dict], None],
+) -> None:
+    """Block between generations while paused; cancellation still wins."""
+    if should_pause is None or not should_pause():
+        return
+    emit({"type": "log", "line": "campaign paused"})
+    while should_pause() and not should_stop():
+        time.sleep(0.2)
+    if not should_stop():
+        emit({"type": "log", "line": "campaign resumed"})
+
+
 def run_campaign(
     cfg: CampaignConfig,
     vault: Vault,
     cache: BarCache,
     emit: Callable[[dict], None],
     should_stop: Callable[[], bool],
+    should_pause: Callable[[], bool] | None = None,
 ) -> None:
     campaign_id = vault.create_campaign(cfg.model_dump_json())
     total_units = len(cfg.symbols) * len(cfg.tribes) * cfg.generations
@@ -120,7 +137,10 @@ def run_campaign(
             split = int(len(bars) * (1.0 - cfg.oos_fraction))
             bars_is = bars.iloc[:split].reset_index(drop=True)
             bars_oos = bars.iloc[split:].reset_index(drop=True)
-            costs = Costs(spread=float(bars["spread"].median()))
+            costs = Costs(
+                spread=float(bars["spread"].median()),
+                commission_per_lot=cfg.commission_per_lot,
+            )
             emit(
                 {
                     "type": "log",
@@ -129,6 +149,7 @@ def run_campaign(
             )
 
             for t_idx, tribe in enumerate(cfg.tribes):
+                _wait_while_paused(should_pause, should_stop, emit)
                 if should_stop():
                     raise _Cancelled()
                 emit({"type": "log", "line": f"breeding tribe '{tribe}' on {symbol}"})
@@ -221,6 +242,7 @@ def run_campaign(
                             }
                         ),
                     )
+                    _wait_while_paused(should_pause, should_stop, emit)
                     if should_stop():
                         raise _Cancelled()
     except _Cancelled:
