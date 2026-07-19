@@ -30,6 +30,7 @@ MANAGEMENT_SPACE = {
     "tp_atr": (0.5, 8.0, False),
     "trail_atr": (0.5, 4.0, False),  # optional gene
     "max_bars": (10, 200, True),  # optional gene
+    "breakeven_atr": (0.3, 2.0, False),  # optional gene: move SL to entry after this run-up
 }
 RISK_SPACE = {"risk_pct": (0.003, 0.02, False)}
 TREND_MA_SPACE = (50, 200, True)

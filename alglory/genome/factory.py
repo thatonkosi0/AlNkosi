@@ -54,8 +54,9 @@ def _draw_management(rng: np.random.Generator) -> ManagementGene:
     return ManagementGene(
         sl_atr=_draw(MANAGEMENT_SPACE["sl_atr"], rng),
         tp_atr=_draw(MANAGEMENT_SPACE["tp_atr"], rng),
-        trail_atr=_draw(MANAGEMENT_SPACE["trail_atr"], rng) if rng.random() < 0.3 else None,
+        trail_atr=_draw(MANAGEMENT_SPACE["trail_atr"], rng) if rng.random() < 0.6 else None,
         max_bars=_draw(MANAGEMENT_SPACE["max_bars"], rng) if rng.random() < 0.3 else None,
+        breakeven_atr=_draw(MANAGEMENT_SPACE["breakeven_atr"], rng) if rng.random() < 0.4 else None,
     )
 
 
@@ -107,8 +108,11 @@ def mutate(g: Genome, rng: np.random.Generator, rate: float = 0.3) -> Genome:
     if rng.random() < rate * 0.5:
         management = replace(
             management,
-            trail_atr=_draw(MANAGEMENT_SPACE["trail_atr"], rng) if rng.random() < 0.5 else None,
+            trail_atr=_draw(MANAGEMENT_SPACE["trail_atr"], rng) if rng.random() < 0.6 else None,
             max_bars=_draw(MANAGEMENT_SPACE["max_bars"], rng) if rng.random() < 0.5 else None,
+            breakeven_atr=(
+                _draw(MANAGEMENT_SPACE["breakeven_atr"], rng) if rng.random() < 0.5 else None
+            ),
         )
 
     risk = g.risk

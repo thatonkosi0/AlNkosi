@@ -1,7 +1,10 @@
+import json
+
 import numpy as np
 import pytest
 
 from alglory.genome import (
+    MANAGEMENT_SPACE,
     PARAM_SPACE,
     TRIBES,
     Genome,
@@ -34,6 +37,9 @@ def _assert_legal(g: Genome):
         h0, h1 = g.filters.session
         assert 0 <= h0 < 24 and 0 < h1 <= 24 and h0 < h1
     assert g.filters.atr_regime in (None, "high", "low")
+    if g.management.breakeven_atr is not None:
+        lo, hi, _ = MANAGEMENT_SPACE["breakeven_atr"]
+        assert lo <= g.management.breakeven_atr <= hi
 
 
 def test_tribes_cover_all_param_space_kinds():
@@ -52,6 +58,23 @@ def test_json_round_trip():
     g = random_genome("trend", _rng(1))
     g2 = Genome.from_json(g.to_json())
     assert g2 == g
+
+
+def test_from_json_legacy_genome_without_breakeven():
+    g = random_genome("trend", _rng(1))
+    d = json.loads(g.to_json())
+    d["management"].pop("breakeven_atr", None)
+    g2 = Genome.from_json(json.dumps(d))
+    assert g2.management.breakeven_atr is None
+
+
+def test_management_genes_favor_adaptive_exits():
+    rng = _rng(7)
+    genomes = [random_genome("trend", rng) for _ in range(300)]
+    trail = sum(g.management.trail_atr is not None for g in genomes)
+    breakeven = sum(g.management.breakeven_atr is not None for g in genomes)
+    assert trail / 300 > 0.45  # trailing stops are now a common gene
+    assert breakeven / 300 > 0.25  # breakeven moves appear regularly
 
 
 def test_mutate_returns_new_legal_genome():

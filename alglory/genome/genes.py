@@ -35,6 +35,7 @@ class ManagementGene:
     tp_atr: float
     trail_atr: float | None
     max_bars: int | None
+    breakeven_atr: float | None = None  # default keeps pre-existing vault genomes loadable
 
 
 @dataclass(frozen=True)

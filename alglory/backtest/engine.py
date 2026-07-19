@@ -6,7 +6,11 @@ Semantics (kept deliberately conservative):
   round-trip cost in the trade direction (cost = spread + commission).
 - SL/TP are anchored to the raw entry open, distances in ATR(14)-at-signal-bar
   multiples. If one bar's range covers both SL and TP, the SL fills first.
-- Trailing stop (if the genome has one) ratchets after each completed bar.
+- Trailing stop (if the genome has one) ratchets after each completed bar,
+  using that bar's ATR so the trail adapts to current volatility (matching
+  the generated MT5 EA, which trails off live ATR).
+- Breakeven (if the genome has one) moves the stop to the entry price once
+  the bar's favorable extreme has run breakeven_atr * entry-ATR.
 - Equity is flat between trades and compounds multiplicatively at exits.
 - Position sizing uses a risk-unit model: pnl_pct = R-multiple * risk_pct,
   which keeps equity math broker-independent.
@@ -43,7 +47,7 @@ class Trade:
     entry: float
     exit: float
     pnl_pct: float
-    reason: str  # 'sl' | 'tp' | 'trail' | 'time' | 'signal' | 'end'
+    reason: str  # 'sl' | 'tp' | 'trail' | 'be' | 'time' | 'signal' | 'end'
 
 
 @dataclass
@@ -165,7 +169,33 @@ def run_backtest(
     eq = 1.0
     trades: list[Trade] = []
 
-    pos = None  # dict with: dir, entry_i, entry, sl, tp, sl_dist, trailed
+    pos = None  # dict with: dir, entry_i, entry, entry_atr, sl, tp, sl_dist, sl_source, be_armed
+
+    def update_stops(i: int, trail_atr_value: float) -> None:
+        """Adjust stops off completed bar i: arm breakeven, ratchet the trail.
+
+        The trail distance uses the supplied ATR (current bar's, so it adapts
+        to volatility); when the SL ratchets, the TP shifts outward in
+        lockstep so winners keep running behind an adaptive corridor.
+        """
+        d = pos["dir"]
+        if mgmt.breakeven_atr is not None and not pos["be_armed"]:
+            trigger = pos["entry"] + d * mgmt.breakeven_atr * pos["entry_atr"]
+            reached = high[i] >= trigger if d == 1 else low[i] <= trigger
+            if reached:
+                pos["be_armed"] = True
+                if (d == 1 and pos["entry"] > pos["sl"]) or (
+                    d == -1 and pos["entry"] < pos["sl"]
+                ):
+                    pos["sl"] = pos["entry"]
+                    pos["sl_source"] = "be"
+        if mgmt.trail_atr is not None:
+            dist = mgmt.trail_atr * trail_atr_value
+            candidate = high[i] - dist if d == 1 else low[i] + dist
+            if (d == 1 and candidate > pos["sl"]) or (d == -1 and candidate < pos["sl"]):
+                pos["tp"] += candidate - pos["sl"]
+                pos["sl"] = candidate
+                pos["sl_source"] = "trail"
 
     def close_position(i: int, price: float, reason: str) -> None:
         nonlocal eq, pos
@@ -203,23 +233,16 @@ def run_backtest(
                 sl_hit = low[i] <= sl if d == 1 else high[i] >= sl
                 tp_hit = high[i] >= tp if d == 1 else low[i] <= tp
                 if sl_hit:
-                    close_position(i, sl, "trail" if pos["trailed"] else "sl")
+                    close_position(i, sl, pos["sl_source"])
                 elif tp_hit:
                     close_position(i, tp, "tp")
                 else:
-                    # 4. trailing ratchet from this completed bar
-                    if mgmt.trail_atr is not None:
-                        trail_dist = mgmt.trail_atr * pos["entry_atr"]
-                        if d == 1:
-                            candidate = high[i] - trail_dist
-                            if candidate > pos["sl"]:
-                                pos["sl"] = candidate
-                                pos["trailed"] = True
-                        else:
-                            candidate = low[i] + trail_dist
-                            if candidate < pos["sl"]:
-                                pos["sl"] = candidate
-                                pos["trailed"] = True
+                    # 4. adjust stops off this completed bar, trailing with
+                    # its ATR so the distance adapts to current volatility
+                    bar_atr = atr_series[i]
+                    if np.isnan(bar_atr):
+                        bar_atr = pos["entry_atr"]
+                    update_stops(i, bar_atr)
 
         if pos is None and signals[i - 1] != 0 and not np.isnan(atr_series[i - 1]):
             d = int(signals[i - 1])
@@ -235,7 +258,8 @@ def run_backtest(
                 "sl": entry - d * sl_dist,
                 "tp": entry + d * tp_dist,
                 "sl_dist": sl_dist,
-                "trailed": False,
+                "sl_source": "sl",
+                "be_armed": False,
             }
             # entry bar itself can hit SL/TP
             sl, tp = pos["sl"], pos["tp"]
@@ -245,15 +269,10 @@ def run_backtest(
                 close_position(i, sl, "sl")
             elif tp_hit:
                 close_position(i, tp, "tp")
-            elif mgmt.trail_atr is not None:
-                # trailing starts ratcheting from the entry bar's extreme
-                trail_dist = mgmt.trail_atr * entry_atr
-                if d == 1 and high[i] - trail_dist > pos["sl"]:
-                    pos["sl"] = high[i] - trail_dist
-                    pos["trailed"] = True
-                elif d == -1 and low[i] + trail_dist < pos["sl"]:
-                    pos["sl"] = low[i] + trail_dist
-                    pos["trailed"] = True
+            else:
+                # stops start adjusting from the entry bar's extreme; the
+                # trail anchors to the entry ATR until the next bar completes
+                update_stops(i, entry_atr)
 
         equity[i] = eq
 

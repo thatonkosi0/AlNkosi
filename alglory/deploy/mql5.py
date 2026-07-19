@@ -78,15 +78,20 @@ def _signal_init(kind: str, p: dict) -> str:
 
 def _signal_body(kind: str, p: dict) -> str:
     if kind == "ma_cross":
-        return """   double fast[3], slow[3];
+        return """   double fast[], slow[];
+   // CopyBuffer fills oldest-first; flip to series so [1] is the last
+   // closed bar and [2] the bar before it (matching the backtester).
+   ArraySetAsSeries(fast, true);
+   ArraySetAsSeries(slow, true);
    if(CopyBuffer(hFast, 0, 0, 3, fast) < 3) return 0;
    if(CopyBuffer(hSlow, 0, 0, 3, slow) < 3) return 0;
-   ArraySetAsSeries(fast, false); // buffers arrive newest-first by default
    if(fast[1] > slow[1] && fast[2] <= slow[2]) return 1;
    if(fast[1] < slow[1] && fast[2] >= slow[2]) return -1;
    return 0;"""
     if kind == "macd_trend":
-        return """   double main[3], sig[3];
+        return """   double main[], sig[];
+   ArraySetAsSeries(main, true);
+   ArraySetAsSeries(sig, true);
    if(CopyBuffer(hMacd, 0, 0, 3, main) < 3) return 0;
    if(CopyBuffer(hMacd, 1, 0, 3, sig) < 3) return 0;
    if(main[1] > sig[1] && main[2] <= sig[2]) return 1;
@@ -104,13 +109,16 @@ def _signal_body(kind: str, p: dict) -> str:
    if(c1 < lower) return -1;
    return 0;"""
     if kind == "rsi_reversion":
-        return f"""   double r[3];
+        return f"""   double r[];
+   ArraySetAsSeries(r, true);
    if(CopyBuffer(hRsi, 0, 0, 3, r) < 3) return 0;
    if(r[1] < {int(p['buy_below'])} && r[2] >= {int(p['buy_below'])}) return 1;
    if(r[1] > {int(p['sell_above'])} && r[2] <= {int(p['sell_above'])}) return -1;
    return 0;"""
     if kind == "bollinger_fade":
-        return """   double upper[2], lower[2];
+        return """   double upper[], lower[];
+   ArraySetAsSeries(upper, true);
+   ArraySetAsSeries(lower, true);
    if(CopyBuffer(hBands, 1, 0, 2, upper) < 2) return 0;
    if(CopyBuffer(hBands, 2, 0, 2, lower) < 2) return 0;
    double c1 = iClose(_Symbol, _Period, 1);
@@ -145,9 +153,12 @@ def generate_ea(
     trend_period = int(g.filters.trend_ma) if use_trend else 100
     use_trail = g.management.trail_atr is not None
     trail_atr = g.management.trail_atr if use_trail else 0.0
+    use_breakeven = g.management.breakeven_atr is not None
+    breakeven_atr = g.management.breakeven_atr if use_breakeven else 0.0
     max_bars = int(g.management.max_bars) if g.management.max_bars is not None else 0
     allow_long = "true" if g.direction in ("long", "both") else "false"
     allow_short = "true" if g.direction in ("short", "both") else "false"
+    atr_regime = {None: 0, "high": 1, "low": -1}[g.filters.atr_regime]
 
     trend_globals = "int hTrend;" if use_trend else ""
     trend_init = (
@@ -157,7 +168,8 @@ def generate_ea(
         else "   // trend filter disabled"
     )
     trend_check = (
-        """   double tr[3];
+        """   double tr[];
+   ArraySetAsSeries(tr, true);
    if(CopyBuffer(hTrend, 0, 0, 3, tr) < 3) return 0;
    if(dir == 1 && tr[1] <= tr[2]) return 0;
    if(dir == -1 && tr[1] >= tr[2]) return 0;"""
@@ -183,11 +195,14 @@ input double InpMaxDDPct = {_flt(guardrails.max_dd_pct)};    // max drawdown per
 input double InpSLAtr = {_flt(g.management.sl_atr)};       // stop loss in ATR multiples
 input double InpTPAtr = {_flt(g.management.tp_atr)};       // take profit in ATR multiples
 input bool   InpUseTrail = {"true" if use_trail else "false"};
-input double InpTrailAtr = {_flt(trail_atr)};
+input double InpTrailAtr = {_flt(trail_atr)};   // trail distance in CURRENT ATR multiples (adaptive)
+input bool   InpUseBreakeven = {"true" if use_breakeven else "false"};
+input double InpBreakevenAtr = {_flt(breakeven_atr)}; // move SL to entry after this run-up (entry-ATR multiples)
 input int    InpMaxBars = {max_bars};        // 0 disables the time exit
 input bool   InpUseSession = {"true" if use_session else "false"};
 input int    InpSessionStart = {int(session_start)};
 input int    InpSessionEnd = {int(session_end)};
+input int    InpAtrRegime = {atr_regime};     // 1 trade high-vol only, -1 low-vol only, 0 off
 input bool   InpAllowLong = {allow_long};
 input bool   InpAllowShort = {allow_short};
 
@@ -201,6 +216,8 @@ int gDayOfYear = -1;
 bool gHalted = false;
 datetime gLastBar = 0;
 datetime gEntryBar = 0;
+double gEntryAtr = 0.0;
+bool gBeArmed = false;
 
 int OnInit()
 {{
@@ -209,9 +226,31 @@ int OnInit()
    if(hAtr == INVALID_HANDLE) return INIT_FAILED;
 {_signal_init(g.signal.kind, p)}
 {trend_init}
+   if(_Symbol != "{symbol}")
+      Print("ALGLORY warning: bred for {symbol} but attached to ", _Symbol,
+            " — this genome was not validated on this symbol.");
+   if(_Period != PERIOD_{timeframe})
+      Print("ALGLORY warning: bred for {timeframe} but attached to a different timeframe chart.");
    gPeakEquity = AccountInfoDouble(ACCOUNT_EQUITY);
    gDayStartEquity = gPeakEquity;
    return INIT_SUCCEEDED;
+}}
+
+double Norm(double price)
+{{
+   return NormalizeDouble(price, _Digits);
+}}
+
+double AtrMedian()
+{{
+   // median ATR of the last 100 completed bars (mirrors the backtester's
+   // rolling-median volatility regime, min 20 observations)
+   double buf[];
+   int got = CopyBuffer(hAtr, 0, 1, 100, buf);
+   if(got < 20) return 0.0;
+   ArraySort(buf);
+   if(got % 2 == 1) return buf[got / 2];
+   return 0.5 * (buf[got / 2 - 1] + buf[got / 2]);
 }}
 
 void OnDeinit(const int reason)
@@ -237,12 +276,21 @@ int FilteredSignal()
       if(dt.hour < InpSessionStart || dt.hour >= InpSessionEnd) return 0;
    }}
 {trend_check}
+   if(InpAtrRegime != 0)
+   {{
+      double med = AtrMedian();
+      if(med <= 0.0) return 0;
+      bool volHigh = CurrentAtr() > med;
+      if(InpAtrRegime == 1 && !volHigh) return 0;
+      if(InpAtrRegime == -1 && volHigh) return 0;
+   }}
    return dir;
 }}
 
 double CurrentAtr()
 {{
-   double a[2];
+   double a[];
+   ArraySetAsSeries(a, true); // a[1] = ATR of the last completed bar
    if(CopyBuffer(hAtr, 0, 0, 2, a) < 2) return 0.0;
    return a[1];
 }}
@@ -307,22 +355,46 @@ void ManagePosition()
          return;
       }}
    }}
+   double sl = PositionGetDouble(POSITION_SL);
+   double tp = PositionGetDouble(POSITION_TP);
+   double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   if(InpUseBreakeven && !gBeArmed && gEntryAtr > 0)
+   {{
+      double run = InpBreakevenAtr * gEntryAtr;
+      bool reached = (type == POSITION_TYPE_BUY) ? (bid >= openPrice + run)
+                                                 : (ask <= openPrice - run);
+      if(reached)
+      {{
+         gBeArmed = true;
+         bool improves = (type == POSITION_TYPE_BUY) ? (sl < openPrice)
+                                                     : (sl == 0 || sl > openPrice);
+         if(improves && trade.PositionModify(_Symbol, Norm(openPrice), tp))
+            sl = Norm(openPrice);
+      }}
+   }}
    if(InpUseTrail && atrNow > 0)
    {{
-      double sl = PositionGetDouble(POSITION_SL);
-      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      // trail distance follows the CURRENT ATR (adaptive to volatility);
+      // the TP shifts outward in lockstep so winners keep running
       if(type == POSITION_TYPE_BUY)
       {{
          double candidate = bid - InpTrailAtr * atrNow;
          if(candidate > sl)
-            trade.PositionModify(_Symbol, candidate, PositionGetDouble(POSITION_TP));
+         {{
+            double newTp = (tp > 0 && sl > 0) ? tp + (candidate - sl) : tp;
+            trade.PositionModify(_Symbol, Norm(candidate), Norm(newTp));
+         }}
       }}
       else
       {{
          double candidate = ask + InpTrailAtr * atrNow;
          if(sl == 0 || candidate < sl)
-            trade.PositionModify(_Symbol, candidate, PositionGetDouble(POSITION_TP));
+         {{
+            double newTp = (tp > 0 && sl > 0) ? tp - (sl - candidate) : tp;
+            trade.PositionModify(_Symbol, Norm(candidate), Norm(newTp));
+         }}
       }}
    }}
 }}
@@ -352,14 +424,28 @@ void OnTick()
    if(dir == 1)
    {{
       double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      if(trade.Buy(lots, _Symbol, 0.0, ask - slDist, ask + tpDist, "ALGLORY"))
+      if(trade.Buy(lots, _Symbol, 0.0, Norm(ask - slDist), Norm(ask + tpDist), "ALGLORY"))
+      {{
          gEntryBar = barTime;
+         gEntryAtr = atrNow;
+         gBeArmed = false;
+      }}
+      else
+         Print("ALGLORY: buy rejected — ", trade.ResultRetcode(), " ",
+               trade.ResultRetcodeDescription());
    }}
    else
    {{
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      if(trade.Sell(lots, _Symbol, 0.0, bid + slDist, bid - tpDist, "ALGLORY"))
+      if(trade.Sell(lots, _Symbol, 0.0, Norm(bid + slDist), Norm(bid - tpDist), "ALGLORY"))
+      {{
          gEntryBar = barTime;
+         gEntryAtr = atrNow;
+         gBeArmed = false;
+      }}
+      else
+         Print("ALGLORY: sell rejected — ", trade.ResultRetcode(), " ",
+               trade.ResultRetcodeDescription());
    }}
 }}
 """

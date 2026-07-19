@@ -224,6 +224,113 @@ def test_build_signals_direction_long_only():
     assert (build_signals(g_long, bars) >= 0).all()
 
 
+def test_breakeven_moves_sl_to_entry_long():
+    bars = make_bars(
+        WARMUP
+        + [
+            (100.0, 101.2, 99.5, 100.8),  # bar 21: entry 100; high >= 101 arms breakeven
+            (100.8, 100.9, 99.6, 99.8),  # bar 22: low 99.6 <= breakeven SL 100
+            FLAT,
+        ]
+    )
+    g = genome_with(
+        ManagementGene(sl_atr=2.0, tp_atr=8.0, trail_atr=None, max_bars=None, breakeven_atr=1.0)
+    )
+    res = run_backtest(g, bars, Costs(spread=0.0), signals=inject(len(bars), i20=1))
+    t = res.trades[0]
+    assert t.reason == "be"
+    assert t.exit == pytest.approx(100.0)
+    assert t.pnl_pct == pytest.approx(0.0)
+
+
+def test_breakeven_moves_sl_to_entry_short():
+    bars = make_bars(
+        WARMUP
+        + [
+            (100.0, 100.4, 98.7, 99.2),  # bar 21: entry short 100; low <= 99 arms breakeven
+            (99.2, 100.3, 99.0, 100.1),  # bar 22: high 100.3 >= breakeven SL 100
+            FLAT,
+        ]
+    )
+    g = genome_with(
+        ManagementGene(sl_atr=2.0, tp_atr=8.0, trail_atr=None, max_bars=None, breakeven_atr=1.0)
+    )
+    res = run_backtest(g, bars, Costs(spread=0.0), signals=inject(len(bars), i20=-1))
+    t = res.trades[0]
+    assert t.reason == "be"
+    assert t.exit == pytest.approx(100.0)
+    assert t.pnl_pct == pytest.approx(0.0)
+
+
+def test_breakeven_not_armed_before_trigger():
+    bars = make_bars(
+        WARMUP
+        + [
+            (100.0, 100.8, 99.5, 100.2),  # bar 21: entry 100; high < 101, no breakeven
+            (100.2, 100.5, 99.7, 100.0),  # bar 22: low 99.7 > SL 98, position survives
+            FLAT,
+        ]
+    )
+    g = genome_with(
+        ManagementGene(sl_atr=2.0, tp_atr=8.0, trail_atr=None, max_bars=None, breakeven_atr=1.0)
+    )
+    res = run_backtest(g, bars, Costs(spread=0.0), signals=inject(len(bars), i20=1))
+    t = res.trades[0]
+    assert t.reason == "end"  # rode to the last bar, never stopped at entry
+
+
+def test_trailing_stop_adapts_to_current_atr():
+    from alglory.indicators import atr as atr_fn
+
+    bars = make_bars(
+        WARMUP
+        + [
+            (100.0, 100.4, 99.8, 100.2),  # bar 21: entry 100, SL=97 TP=108
+            (100.2, 106.0, 100.0, 105.5),  # bar 22: big range widens ATR; trail from 106
+            (105.5, 105.6, 104.0, 104.2),  # bar 23: dips into the trailed stop
+            FLAT,
+        ]
+    )
+    g = genome_with(ManagementGene(sl_atr=3.0, tp_atr=8.0, trail_atr=1.0, max_bars=None))
+    res = run_backtest(g, bars, Costs(spread=0.0), signals=inject(len(bars), i20=1))
+    high = bars["high"].to_numpy()
+    low = bars["low"].to_numpy()
+    close = bars["close"].to_numpy()
+    atr22 = atr_fn(high, low, close, 14)[22]
+    assert atr22 > 1.0  # the range expansion actually widened ATR
+    t = res.trades[0]
+    assert t.reason == "trail"
+    # trail distance uses the ATR of the bar being ratcheted from (adaptive),
+    # not the ATR frozen at entry (which would exit at 105.0)
+    assert t.exit == pytest.approx(106.0 - atr22)
+
+
+def test_trailing_take_profit_shifts_with_stop():
+    from alglory.indicators import atr as atr_fn
+
+    bars = make_bars(
+        WARMUP
+        + [
+            (100.0, 100.4, 99.8, 100.2),  # bar 21: entry 100, SL=98 TP=103
+            (100.2, 103.4, 100.1, 103.2),  # bar 22: high 103.4 crosses the ORIGINAL tp 103
+            (103.2, 103.3, 102.0, 102.1),  # bar 23: dips into the trailed stop
+            FLAT,
+        ]
+    )
+    g = genome_with(ManagementGene(sl_atr=2.0, tp_atr=3.0, trail_atr=1.0, max_bars=None))
+    res = run_backtest(g, bars, Costs(spread=0.0), signals=inject(len(bars), i20=1))
+    high = bars["high"].to_numpy()
+    low = bars["low"].to_numpy()
+    close = bars["close"].to_numpy()
+    atr22 = atr_fn(high, low, close, 14)[22]
+    assert len(res.trades) == 1
+    t = res.trades[0]
+    # TP trailed outward in lockstep with the SL ratchet, so the fixed
+    # TP at 103 never fired and the winner ran until the trail caught it
+    assert t.reason == "trail"
+    assert t.exit == pytest.approx(103.4 - atr22)
+
+
 def test_build_signals_is_causal(bars_h1):
     sig = SignalGene(kind="ma_cross", params={"fast": 10, "slow": 40})
     g = Genome(
