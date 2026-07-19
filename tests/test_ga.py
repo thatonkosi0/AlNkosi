@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from alglory.backtest.engine import Costs
 from alglory.evolve.fitness import FitnessConfig, OOSGate, oos_pass
@@ -82,3 +83,49 @@ def test_survivors_and_culled_partition_population(bars_h1):
     for r in _run(bars_h1):
         assert set(r.survivors) | set(r.culled) == set(range(GA.population))
         assert set(r.survivors) & set(r.culled) == set()
+
+
+def _split(bars):
+    bars_is = bars.iloc[:4000].reset_index(drop=True)
+    bars_oos = bars.iloc[4000:].reset_index(drop=True)
+    return bars_is, bars_oos
+
+
+def test_next_population_exposed_for_checkpointing(bars_h1):
+    results = _run(bars_h1)
+    for r in results[:-1]:
+        assert r.next_population is not None
+        assert len(r.next_population) == GA.population
+    assert results[-1].next_population is None  # nothing left to breed
+
+
+def test_resume_evaluates_checkpointed_population(bars_h1):
+    bars_is, bars_oos = _split(bars_h1)
+    full = _run(bars_h1, seed=7)
+    ckpt = full[0]
+    resumed = list(
+        evolve_tribe(
+            "trend", bars_is, bars_oos, COSTS, GA, FIT, GATE,
+            seed=7, bars_per_year=BARS_PER_YEAR,
+            initial=ckpt.next_population, start_gen=1,
+        )
+    )
+    assert [r.gen for r in resumed] == [1, 2]
+    # generation 1 of the resumed run evaluates exactly the checkpointed pop
+    assert [e.genome for e in resumed[0].evaluated] == ckpt.next_population
+
+
+def test_already_vaulted_suppresses_duplicates(bars_h1):
+    bars_is, bars_oos = _split(bars_h1)
+    first = _run(bars_h1, seed=42)
+    keys = {g.to_json() for r in first for g, _, _ in r.vaulted}
+    if not keys:
+        pytest.skip("seed produced no vaulted strategies to dedupe against")
+    rerun = list(
+        evolve_tribe(
+            "trend", bars_is, bars_oos, COSTS, GA, FIT, GATE,
+            seed=42, bars_per_year=BARS_PER_YEAR, already_vaulted=keys,
+        )
+    )
+    rerun_keys = {g.to_json() for r in rerun for g, _, _ in r.vaulted}
+    assert rerun_keys & keys == set()

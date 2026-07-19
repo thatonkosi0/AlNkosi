@@ -113,6 +113,28 @@ def create_app(cfg: AppConfig) -> FastAPI:
         manager.resume()
         return {"status": "resuming"}
 
+    @app.post("/api/campaigns/{cid}/restart", status_code=202)
+    def restart_campaign(cid: int):
+        manager = app.state.manager
+        if manager.is_running():
+            raise HTTPException(409, "A campaign is already running; cancel it first.")
+        row = vault().get_campaign(cid)
+        if row is None:
+            raise HTTPException(404, f"Campaign {cid} not found.")
+        if row["status"] not in ("failed", "cancelled"):
+            raise HTTPException(
+                422, f"Campaign {cid} is {row['status']!r}; only failed or "
+                "cancelled campaigns can be resumed."
+            )
+        if not row["progress_json"]:
+            raise HTTPException(422, f"Campaign {cid} has no checkpoint to resume from.")
+        cfg_c = CampaignConfig.model_validate_json(row["config_json"])
+        try:
+            manager.start(cfg_c, resume_campaign_id=cid)
+        except BusyError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"status": "resuming", "campaign_id": cid}
+
     @app.get("/api/campaigns")
     def list_campaigns():
         return vault().list_campaigns()
@@ -131,10 +153,24 @@ def create_app(cfg: AppConfig) -> FastAPI:
         tribe: str | None = None,
         sort: str = "oos_net_profit",
         desc: bool = True,
+        min_oos_net_profit: float | None = None,
+        min_oos_profit_factor: float | None = None,
+        min_oos_sharpe: float | None = None,
+        min_oos_trades: float | None = None,
+        max_oos_max_drawdown: float | None = None,
     ):
         try:
             return vault().list_strategies(
-                symbol=symbol, timeframe=timeframe, tribe=tribe, sort=sort, desc=desc
+                symbol=symbol,
+                timeframe=timeframe,
+                tribe=tribe,
+                sort=sort,
+                desc=desc,
+                min_oos_net_profit=min_oos_net_profit,
+                min_oos_profit_factor=min_oos_profit_factor,
+                min_oos_sharpe=min_oos_sharpe,
+                min_oos_trades=min_oos_trades,
+                max_oos_max_drawdown=max_oos_max_drawdown,
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc

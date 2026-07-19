@@ -91,10 +91,17 @@
         </label>
         <label>MIN TRADES <input type="number" name="min_trades" value="30" min="1"></label>
         <label>DD CAP <input type="number" name="dd_cap" value="0.35" min="0.05" max="1" step="0.05"></label>
+        <label>COMMISSION/LOT
+          <input type="number" name="commission_per_lot" value="0" min="0" step="0.00001"
+                 title="round-trip commission per lot, in price units">
+        </label>
         <label>SEED (blank = random) <input type="number" name="seed" placeholder="random"></label>
         <div class="control-actions">
           <button type="submit" id="launch-btn" class="btn-primary">▶ LAUNCH CAMPAIGN</button>
+          <button type="button" id="pause-btn" class="pill" disabled>❚❚ PAUSE</button>
           <button type="button" id="cancel-btn" class="btn-danger" disabled>■ CANCEL</button>
+          <button type="button" id="resume-last-btn" class="pill"
+                  title="resume the most recent failed or cancelled campaign from its checkpoint">⟳ RESUME LAST</button>
         </div>
       </form>
       <div id="control-error" class="error-box" hidden></div>
@@ -124,6 +131,9 @@
           <option value="oos_max_drawdown">OOS DD</option>
           <option value="created_at">NEWEST</option>
         </select>
+        <input type="number" id="vf-minprofit" placeholder="MIN PROFIT %" step="1" title="minimum OOS net profit, percent">
+        <input type="number" id="vf-minpf" placeholder="MIN PF" step="0.1" min="0" title="minimum OOS profit factor">
+        <input type="number" id="vf-maxdd" placeholder="MAX DD %" step="1" min="0" title="maximum OOS drawdown, percent">
         <button id="vf-apply" class="pill">FILTER</button>
       </div>
       <table class="vault-table" id="vault-table">

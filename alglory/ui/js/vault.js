@@ -14,6 +14,12 @@ export async function refreshVault() {
   if (symbol) params.set("symbol", symbol.toUpperCase());
   if (tribe) params.set("tribe", tribe);
   params.set("sort", sort);
+  const minProfit = document.getElementById("vf-minprofit").value;
+  const minPf = document.getElementById("vf-minpf").value;
+  const maxDd = document.getElementById("vf-maxdd").value;
+  if (minProfit !== "") params.set("min_oos_net_profit", Number(minProfit) / 100);
+  if (minPf !== "") params.set("min_oos_profit_factor", minPf);
+  if (maxDd !== "") params.set("max_oos_max_drawdown", Number(maxDd) / 100);
   const rows = await api(`/api/vault?${params}`);
   const tbody = document.querySelector("#vault-table tbody");
   document.getElementById("vault-empty").hidden = rows.length > 0;
@@ -47,6 +53,7 @@ function geneTags(genome) {
     <span class="gene-tag gene-mgmt">SL ${m.sl_atr.toFixed(2)} ATR</span>
     <span class="gene-tag gene-mgmt">TP ${m.tp_atr.toFixed(2)} ATR</span>`;
   if (m.trail_atr) html += `<span class="gene-tag gene-mgmt">TRAIL ${m.trail_atr.toFixed(2)} ATR</span>`;
+  if (m.breakeven_atr) html += `<span class="gene-tag gene-mgmt">BE ${m.breakeven_atr.toFixed(2)} ATR</span>`;
   if (m.max_bars) html += `<span class="gene-tag gene-mgmt">MAX ${m.max_bars} BARS</span>`;
   html += `</div><div class="gene-group">
     <span class="gene-tag gene-risk">RISK ${(genome.risk.risk_pct * 100).toFixed(2)}%/trade</span></div>`;

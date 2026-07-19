@@ -47,6 +47,9 @@ class GenerationResult:
     culled: list[int]
     top: Evaluated
     vaulted: list[tuple[Genome, Metrics, Metrics]] = field(default_factory=list)
+    # Population bred for gen+1, or None on the final generation. Exposed so
+    # the campaign can checkpoint it and resume a crashed run mid-tribe.
+    next_population: list[Genome] | None = None
 
 
 def _evaluate(
@@ -77,12 +80,19 @@ def evolve_tribe(
     gate: OOSGate,
     seed: int,
     bars_per_year: float,
+    initial: list[Genome] | None = None,
+    start_gen: int = 0,
+    already_vaulted: set[str] | None = None,
 ):
     rng = np.random.default_rng(seed)
-    genomes = [random_genome(tribe, rng) for _ in range(ga.population)]
-    already_vaulted: set[str] = set()
+    genomes = (
+        list(initial)
+        if initial is not None
+        else [random_genome(tribe, rng) for _ in range(ga.population)]
+    )
+    already_vaulted = set(already_vaulted) if already_vaulted else set()
 
-    for gen in range(ga.generations):
+    for gen in range(start_gen, ga.generations):
         evaluated = [
             _evaluate(g, bars_is, costs, fit_cfg, bars_per_year) for g in genomes
         ]
@@ -108,6 +118,22 @@ def evolve_tribe(
                 vaulted.append((cand.genome, cand.is_metrics, oos_metrics))
                 already_vaulted.add(key)
 
+        # Breed the next generation before yielding: elites unchanged, rest
+        # via tournament. Yielding it lets the campaign checkpoint the exact
+        # population a resumed run should continue from.
+        next_genomes: list[Genome] | None = None
+        if gen < ga.generations - 1:
+            next_genomes = [evaluated[i].genome for i in order[: ga.elite]]
+            while len(next_genomes) < ga.population:
+                parent_a = _tournament(evaluated, ga.tournament_k, rng)
+                if rng.random() < ga.cx_prob:
+                    parent_b = _tournament(evaluated, ga.tournament_k, rng)
+                    child = crossover(parent_a, parent_b, rng)
+                else:
+                    child = parent_a
+                child = mutate(child, rng, rate=ga.mut_rate)
+                next_genomes.append(child)
+
         yield GenerationResult(
             gen=gen,
             tribe=tribe,
@@ -116,20 +142,9 @@ def evolve_tribe(
             culled=culled,
             top=top,
             vaulted=vaulted,
+            next_population=next_genomes,
         )
 
-        if gen == ga.generations - 1:
+        if next_genomes is None:
             break
-
-        # Breed the next generation: elites unchanged, rest via tournament.
-        next_genomes = [evaluated[i].genome for i in order[: ga.elite]]
-        while len(next_genomes) < ga.population:
-            parent_a = _tournament(evaluated, ga.tournament_k, rng)
-            if rng.random() < ga.cx_prob:
-                parent_b = _tournament(evaluated, ga.tournament_k, rng)
-                child = crossover(parent_a, parent_b, rng)
-            else:
-                child = parent_a
-            child = mutate(child, rng, rate=ga.mut_rate)
-            next_genomes.append(child)
         genomes = next_genomes

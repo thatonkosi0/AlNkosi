@@ -16,16 +16,18 @@ class FakeManager:
         self.started_with = None
         self.stopped = False
         self.paused = False
+        self.resume_id = None
         self.current_campaign_id = None
         self.last_events = []
 
     def is_running(self):
         return self.running
 
-    def start(self, cfg: CampaignConfig):
+    def start(self, cfg: CampaignConfig, resume_campaign_id=None):
         if self.running:
             raise BusyError("busy")
         self.started_with = cfg
+        self.resume_id = resume_campaign_id
         self.running = True
 
     def stop(self):
@@ -116,6 +118,44 @@ def test_campaign_pause_and_resume(app_client):
     assert status["campaign"]["paused"] is True
     assert client.post("/api/campaigns/resume").status_code == 200
     assert fake.paused is False
+
+
+def test_campaign_restart(app_client):
+    client, fake, cfg = app_client
+    vault = Vault(cfg.db_path)
+    assert client.post("/api/campaigns/424242/restart").status_code == 404
+
+    cid = vault.create_campaign('{"symbols": ["EURUSD"], "tribes": ["trend"]}')
+    # still marked running -> not resumable
+    assert client.post(f"/api/campaigns/{cid}/restart").status_code == 422
+    vault.update_campaign(cid, status="failed")
+    # failed but never checkpointed -> not resumable
+    assert client.post(f"/api/campaigns/{cid}/restart").status_code == 422
+
+    vault.update_campaign(
+        cid,
+        progress_json='{"symbol": "EURUSD", "tribe": "trend", "gen": 1, '
+        '"units_done": 1, "population": null}',
+    )
+    r = client.post(f"/api/campaigns/{cid}/restart")
+    assert r.status_code == 202
+    assert fake.resume_id == cid
+    assert fake.started_with.symbols == ["EURUSD"]
+
+    fake.running = True
+    assert client.post(f"/api/campaigns/{cid}/restart").status_code == 409
+
+
+def test_vault_metric_filter_params(app_client):
+    client, fake, cfg = app_client
+    _seed_strategy(cfg, net=0.1)
+    _seed_strategy(cfg, net=0.6)
+    rows = client.get("/api/vault?min_oos_net_profit=0.3").json()
+    assert len(rows) == 1
+    assert rows[0]["oos_net_profit"] == pytest.approx(0.6)
+    # seeded strategies carry 10% drawdown, so a 5% cap filters everything
+    assert client.get("/api/vault?max_oos_max_drawdown=0.05").json() == []
+    assert len(client.get("/api/vault?min_oos_profit_factor=1.0").json()) == 2
 
 
 def test_campaign_get_by_id(app_client):

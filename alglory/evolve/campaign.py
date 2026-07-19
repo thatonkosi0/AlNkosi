@@ -20,7 +20,7 @@ from alglory.data.cache import BarCache, check_sufficiency
 from alglory.data.sample import generate_bars
 from alglory.evolve.fitness import FitnessConfig, OOSGate
 from alglory.evolve.ga import GAParams, evolve_tribe
-from alglory.genome import TRIBES
+from alglory.genome import TRIBES, Genome
 from alglory.vault.db import Vault
 
 SAMPLE_BARS = 6000
@@ -104,6 +104,29 @@ def _wait_while_paused(
         emit({"type": "log", "line": "campaign resumed"})
 
 
+def _resume_state(cfg: CampaignConfig, ckpt: dict) -> tuple[int, int, int, list[Genome] | None]:
+    """Where a checkpointed campaign continues: symbol idx, tribe idx,
+    start generation, and the population to seed the resumed tribe with."""
+    sym_start = cfg.symbols.index(ckpt["symbol"])
+    tribe_start = cfg.tribes.index(ckpt["tribe"])
+    start_gen = int(ckpt["gen"])  # checkpoint gen is 1-based == next 0-based gen
+    pop_json = ckpt.get("population")
+    population = [Genome.from_json(j) for j in pop_json] if pop_json else None
+
+    if start_gen >= cfg.generations:
+        # the checkpointed tribe finished its last generation: move on
+        tribe_start += 1
+        start_gen, population = 0, None
+        if tribe_start >= len(cfg.tribes):
+            tribe_start = 0
+            sym_start += 1
+    elif population is None:
+        # checkpoint predates population snapshots: redo the tribe (the
+        # vault-seeded dedupe set prevents duplicate strategies)
+        start_gen = 0
+    return sym_start, tribe_start, start_gen, population
+
+
 def run_campaign(
     cfg: CampaignConfig,
     vault: Vault,
@@ -111,8 +134,26 @@ def run_campaign(
     emit: Callable[[dict], None],
     should_stop: Callable[[], bool],
     should_pause: Callable[[], bool] | None = None,
+    resume_campaign_id: int | None = None,
 ) -> None:
-    campaign_id = vault.create_campaign(cfg.model_dump_json())
+    sym_start = tribe_start = resume_gen = 0
+    resume_pop: list[Genome] | None = None
+    resuming = resume_campaign_id is not None
+    if resuming:
+        row = vault.get_campaign(resume_campaign_id)
+        if row is None or not row["progress_json"]:
+            raise ValueError(f"Campaign {resume_campaign_id} has no checkpoint to resume from.")
+        ckpt = json.loads(row["progress_json"])
+        campaign_id = resume_campaign_id
+        vault.update_campaign(campaign_id, status="running")
+        sym_start, tribe_start, resume_gen, resume_pop = _resume_state(cfg, ckpt)
+        vaulted_total = int(ckpt.get("vaulted_total", 0))
+        units_done = int(ckpt.get("units_done", 0))
+    else:
+        campaign_id = vault.create_campaign(cfg.model_dump_json())
+        vaulted_total = 0
+        units_done = 0
+
     total_units = len(cfg.symbols) * len(cfg.tribes) * cfg.generations
     emit(
         {
@@ -120,18 +161,27 @@ def run_campaign(
             "campaign_id": campaign_id,
             "config": cfg.model_dump(),
             "total_units": total_units,
+            "resumed": resuming,
         }
     )
+    if resuming:
+        emit(
+            {
+                "type": "log",
+                "line": f"resuming campaign #{campaign_id} from checkpoint "
+                f"({units_done}/{total_units} generation units done)",
+            }
+        )
 
-    vaulted_total = 0
     status, error = "done", None
     try:
         fit_cfg = FitnessConfig(min_trades=cfg.min_trades, dd_cap=cfg.dd_cap)
         gate = OOSGate()
         ga = GAParams(population=cfg.population, generations=cfg.generations)
-        units_done = 0
 
-        for symbol in cfg.symbols:
+        for s_idx, symbol in enumerate(cfg.symbols):
+            if s_idx < sym_start:
+                continue
             bars = _load_bars(cfg, symbol, cache, emit)
             check_sufficiency(bars, MIN_BARS)
             split = int(len(bars) * (1.0 - cfg.oos_fraction))
@@ -149,6 +199,9 @@ def run_campaign(
             )
 
             for t_idx, tribe in enumerate(cfg.tribes):
+                if s_idx == sym_start and t_idx < tribe_start:
+                    continue
+                is_resumed_tribe = resuming and s_idx == sym_start and t_idx == tribe_start
                 _wait_while_paused(should_pause, should_stop, emit)
                 if should_stop():
                     raise _Cancelled()
@@ -164,6 +217,13 @@ def run_campaign(
                     gate,
                     seed=seed,
                     bars_per_year=BARS_PER_YEAR[cfg.timeframe],
+                    initial=resume_pop if is_resumed_tribe else None,
+                    start_gen=resume_gen if is_resumed_tribe else 0,
+                    already_vaulted=(
+                        vault.campaign_tribe_genomes(campaign_id, symbol, tribe)
+                        if is_resumed_tribe
+                        else None
+                    ),
                 ):
                     for genome, is_m, oos_m in result.vaulted:
                         from alglory.backtest.engine import run_backtest
@@ -239,6 +299,13 @@ def run_campaign(
                                 "symbol": symbol,
                                 "tribe": tribe,
                                 "gen": result.gen + 1,
+                                # next generation's population, so a failed or
+                                # cancelled campaign can resume mid-tribe
+                                "population": (
+                                    [g.to_json() for g in result.next_population]
+                                    if result.next_population
+                                    else None
+                                ),
                             }
                         ),
                     )

@@ -10,10 +10,10 @@ def vault(tmp_path):
     return Vault(tmp_path / "vault.db")
 
 
-def _metrics(net=0.2, pf=1.8):
+def _metrics(net=0.2, pf=1.8, dd=0.1):
     return {
         "net_profit": net,
-        "max_drawdown": 0.1,
+        "max_drawdown": dd,
         "profit_factor": pf,
         "sharpe": 1.2,
         "win_rate": 0.5,
@@ -22,7 +22,10 @@ def _metrics(net=0.2, pf=1.8):
     }
 
 
-def _add(vault, tribe="trend", symbol="EURUSD", timeframe="H1", net=0.2, campaign_id=None):
+def _add(
+    vault, tribe="trend", symbol="EURUSD", timeframe="H1", net=0.2, pf=1.8, dd=0.1,
+    campaign_id=None,
+):
     rng = np.random.default_rng(0)
     g = random_genome(tribe, rng)
     return vault.add_strategy(
@@ -32,7 +35,7 @@ def _add(vault, tribe="trend", symbol="EURUSD", timeframe="H1", net=0.2, campaig
         timeframe=timeframe,
         genome_json=g.to_json(),
         is_metrics=_metrics(),
-        oos_metrics=_metrics(net=net),
+        oos_metrics=_metrics(net=net, pf=pf, dd=dd),
         equity=np.linspace(1.0, 1.0 + net, 50),
         campaign_id=campaign_id,
     )
@@ -67,6 +70,37 @@ def test_list_filters_and_sort(vault):
     assert [r["oos_net_profit"] for r in top] == pytest.approx([0.5, 0.3, 0.1])
     asc = vault.list_strategies(sort="oos_net_profit", desc=False)
     assert asc[0]["oos_net_profit"] == pytest.approx(0.1)
+
+
+def test_list_metric_range_filters(vault):
+    _add(vault, net=0.1, pf=1.2, dd=0.05)
+    _add(vault, net=0.5, pf=2.5, dd=0.20)
+    _add(vault, net=-0.2, pf=0.8, dd=0.40)
+
+    assert len(vault.list_strategies(min_oos_net_profit=0.0)) == 2
+    assert len(vault.list_strategies(min_oos_profit_factor=2.0)) == 1
+    assert len(vault.list_strategies(max_oos_max_drawdown=0.25)) == 2
+    combined = vault.list_strategies(min_oos_net_profit=0.2, min_oos_profit_factor=1.0)
+    assert len(combined) == 1
+    assert combined[0]["oos_net_profit"] == pytest.approx(0.5)
+    # None means "no constraint"
+    assert len(vault.list_strategies(min_oos_profit_factor=None)) == 3
+
+
+def test_list_rejects_unknown_metric_filter(vault):
+    _add(vault)
+    with pytest.raises(ValueError, match="filter"):
+        vault.list_strategies(min_bogus_metric=1.0)
+
+
+def test_campaign_tribe_genomes(vault):
+    cid = vault.create_campaign("{}")
+    sid = _add(vault, campaign_id=cid)
+    _add(vault, campaign_id=cid, tribe="momentum", symbol="GBPUSD")
+    _add(vault)  # not part of the campaign
+    genomes = vault.campaign_tribe_genomes(cid, "EURUSD", "trend")
+    assert genomes == {vault.get_strategy(sid)["genome_json"]}
+    assert vault.campaign_tribe_genomes(cid, "USDJPY", "trend") == set()
 
 
 def test_list_rejects_unknown_sort_column(vault):

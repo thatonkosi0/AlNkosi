@@ -1,7 +1,8 @@
 // CONTROL tab: campaign form, cancel, live feed terminal.
 import { api, toast, fxMode } from "/js/app.js";
 
-let terminal, launchBtn, cancelBtn, errorBox;
+let terminal, launchBtn, cancelBtn, pauseBtn, resumeLastBtn, errorBox;
+let isPaused = false;
 let typeQueue = [];
 let typing = false;
 
@@ -38,6 +39,14 @@ function drainQueue() {
 function setRunning(running) {
   launchBtn.disabled = running;
   cancelBtn.disabled = !running;
+  pauseBtn.disabled = !running;
+  resumeLastBtn.disabled = running;
+  if (!running) setPaused(false);
+}
+
+function setPaused(paused) {
+  isPaused = paused;
+  pauseBtn.textContent = paused ? "▶ RESUME" : "❚❚ PAUSE";
 }
 
 export function controlHandleEvent(event) {
@@ -77,6 +86,8 @@ export function initControl() {
   terminal = document.getElementById("control-terminal");
   launchBtn = document.getElementById("launch-btn");
   cancelBtn = document.getElementById("cancel-btn");
+  pauseBtn = document.getElementById("pause-btn");
+  resumeLastBtn = document.getElementById("resume-last-btn");
   errorBox = document.getElementById("control-error");
 
   document.getElementById("campaign-form").addEventListener("submit", async (e) => {
@@ -99,6 +110,7 @@ export function initControl() {
       oos_fraction: Number(form.get("oos_fraction")),
       min_trades: Number(form.get("min_trades")),
       dd_cap: Number(form.get("dd_cap")),
+      commission_per_lot: Number(form.get("commission_per_lot")) || 0,
     };
     if (form.get("seed")) payload.seed = Number(form.get("seed"));
     try {
@@ -120,7 +132,38 @@ export function initControl() {
     }
   });
 
+  pauseBtn.addEventListener("click", async () => {
+    const path = isPaused ? "/api/campaigns/resume" : "/api/campaigns/pause";
+    try {
+      await api(path, { method: "POST" });
+      setPaused(!isPaused);
+      typeLine(isPaused ? ">> pause requested" : ">> resume requested");
+    } catch (err) {
+      toast(err.message);
+    }
+  });
+
+  resumeLastBtn.addEventListener("click", async () => {
+    try {
+      const campaigns = await api("/api/campaigns");
+      const resumable = campaigns.find(
+        (c) => ["failed", "cancelled"].includes(c.status) && c.progress_json
+      );
+      if (!resumable) {
+        toast("No failed or cancelled campaign with a checkpoint to resume.");
+        return;
+      }
+      await api(`/api/campaigns/${resumable.id}/restart`, { method: "POST" });
+      setRunning(true);
+      typeLine(`>> resuming campaign #${resumable.id} from its last checkpoint`);
+      location.hash = "#deck";
+    } catch (err) {
+      toast(err.message);
+    }
+  });
+
   document.addEventListener("alglory:status", (e) => {
     setRunning(e.detail.campaign.running);
+    if (e.detail.campaign.running) setPaused(e.detail.campaign.paused);
   });
 }

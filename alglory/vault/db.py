@@ -29,6 +29,15 @@ _SORTABLE = {f"{p}_{k}" for p in ("is", "oos") for k in _METRIC_KEYS} | {
     "timeframe",
 }
 
+# Metric-range filters accepted by list_strategies: name -> (column, operator).
+_RANGE_FILTERS = {
+    "min_oos_net_profit": ("oos_net_profit", ">="),
+    "min_oos_profit_factor": ("oos_profit_factor", ">="),
+    "min_oos_sharpe": ("oos_sharpe", ">="),
+    "min_oos_trades": ("oos_trades", ">="),
+    "max_oos_max_drawdown": ("oos_max_drawdown", "<="),
+}
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS strategies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,14 +136,25 @@ class Vault:
         sort: str = "oos_net_profit",
         desc: bool = True,
         limit: int = 200,
+        **ranges: float | None,
     ) -> list[dict]:
         if sort not in _SORTABLE:
             raise ValueError(f"Unknown sort column {sort!r}; allowed: {sorted(_SORTABLE)}")
+        unknown = set(ranges) - set(_RANGE_FILTERS)
+        if unknown:
+            raise ValueError(
+                f"Unknown metric filters {sorted(unknown)}; allowed: {sorted(_RANGE_FILTERS)}"
+            )
         where, params = [], []
         for col, val in (("symbol", symbol), ("timeframe", timeframe), ("tribe", tribe)):
             if val is not None:
                 where.append(f"{col} = ?")
                 params.append(val)
+        for name, val in ranges.items():
+            if val is not None:
+                col, op = _RANGE_FILTERS[name]
+                where.append(f"{col} {op} ?")
+                params.append(float(val))
         clause = f"WHERE {' AND '.join(where)}" if where else ""
         order = "DESC" if desc else "ASC"
         sortable_cols = ", ".join(
@@ -160,6 +180,20 @@ class Vault:
         blob = d.pop("equity_blob")
         d["equity"] = _unpack_equity(blob) if blob else []
         return d
+
+    def campaign_tribe_genomes(self, campaign_id: int, symbol: str, tribe: str) -> set[str]:
+        """Genome JSONs already vaulted by a campaign for one symbol/tribe.
+
+        Seeds the GA's dedupe set when a crashed campaign resumes, so the
+        rerun never writes the same strategy twice.
+        """
+        with self._conn() as con:
+            rows = con.execute(
+                "SELECT genome_json FROM strategies "
+                "WHERE campaign_id = ? AND symbol = ? AND tribe = ?",
+                (campaign_id, symbol, tribe),
+            ).fetchall()
+        return {r["genome_json"] for r in rows}
 
     def delete_strategy(self, sid: int) -> bool:
         with self._conn() as con:

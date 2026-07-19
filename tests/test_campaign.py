@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from alglory.data.cache import BarCache
@@ -147,6 +149,58 @@ def test_campaign_cancel_while_paused(vault, cache):
         should_pause=should_pause,
     )
     assert events[-1]["status"] == "cancelled"
+
+
+def test_campaign_resumes_from_checkpoint(vault, cache):
+    events = _run(TINY, vault, cache, stop_after=1)
+    assert events[-1]["status"] == "cancelled"
+    cid = events[0]["campaign_id"]
+    ckpt = json.loads(vault.get_campaign(cid)["progress_json"])
+    assert ckpt["population"], "checkpoint must carry the next generation's population"
+    units_before = ckpt["units_done"]
+    assert units_before >= 1
+
+    events2 = []
+    run_campaign(
+        CampaignConfig(**TINY),
+        vault,
+        cache,
+        emit=events2.append,
+        should_stop=lambda: False,
+        resume_campaign_id=cid,
+    )
+    started = events2[0]
+    assert started["type"] == "campaign_started"
+    assert started["resumed"] is True
+    assert started["campaign_id"] == cid
+    assert events2[-1]["status"] == "done"
+    assert vault.get_campaign(cid)["status"] == "done"
+
+    gens = [e for e in events2 if e["type"] == "generation"]
+    total = started["total_units"]
+    # picks up exactly where the checkpoint left off — no unit is redone
+    assert len(gens) == total - units_before
+    assert gens[0]["units_done"] == units_before + 1
+    assert gens[-1]["units_done"] == total
+
+    # the resumed run never re-vaults a strategy the first run already stored
+    jsons = [
+        vault.get_strategy(r["id"])["genome_json"] for r in vault.list_strategies(limit=500)
+    ]
+    assert len(jsons) == len(set(jsons))
+
+
+def test_campaign_resume_requires_checkpoint(vault, cache):
+    cid = vault.create_campaign(CampaignConfig(**TINY).model_dump_json())
+    with pytest.raises(ValueError, match="checkpoint"):
+        run_campaign(
+            CampaignConfig(**TINY),
+            vault,
+            cache,
+            emit=lambda e: None,
+            should_stop=lambda: False,
+            resume_campaign_id=cid,
+        )
 
 
 def test_campaign_config_validation():

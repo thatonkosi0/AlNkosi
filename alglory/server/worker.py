@@ -17,7 +17,15 @@ from alglory.evolve.campaign import CampaignConfig, run_campaign
 from alglory.vault.db import Vault
 
 
-def _worker_main(cfg_json: str, db_path: str, data_dir: str, q, stop_event, pause_event) -> None:
+def _worker_main(
+    cfg_json: str,
+    db_path: str,
+    data_dir: str,
+    q,
+    stop_event,
+    pause_event,
+    resume_campaign_id: int | None = None,
+) -> None:
     cfg = CampaignConfig.model_validate_json(cfg_json)
     vault = Vault(Path(db_path))
     cache = BarCache(Path(data_dir))
@@ -28,6 +36,7 @@ def _worker_main(cfg_json: str, db_path: str, data_dir: str, q, stop_event, paus
         emit=q.put,
         should_stop=stop_event.is_set,
         should_pause=pause_event.is_set,
+        resume_campaign_id=resume_campaign_id,
     )
 
 
@@ -50,13 +59,13 @@ class CampaignManager:
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.is_alive()
 
-    def start(self, cfg: CampaignConfig) -> None:
+    def start(self, cfg: CampaignConfig, resume_campaign_id: int | None = None) -> None:
         if self.is_running():
             raise BusyError("A campaign is already running; cancel it first.")
         self._queue = self._ctx.Queue()
         self._stop_event = self._ctx.Event()
         self._pause_event = self._ctx.Event()
-        self.current_campaign_id = None
+        self.current_campaign_id = resume_campaign_id
         self._proc = self._ctx.Process(
             target=_worker_main,
             args=(
@@ -66,6 +75,7 @@ class CampaignManager:
                 self._queue,
                 self._stop_event,
                 self._pause_event,
+                resume_campaign_id,
             ),
             daemon=True,
         )
