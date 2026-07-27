@@ -312,6 +312,80 @@ def test_deploy_custom_out_dir_marks_target(app_client, tmp_path):
     assert body["path"].replace("\\", "/").startswith(str(dest).replace("\\", "/"))
 
 
+class FakeExecutorManager:
+    def __init__(self):
+        self.armed = None
+        self.stopped = False
+
+    def arm_strategies(self, runtimes, mode, confirm_live, *, poll_seconds=5.0):
+        self.armed = {"runtimes": runtimes, "mode": mode, "confirm_live": confirm_live}
+
+    def stop(self):
+        self.stopped = True
+
+    def status(self):
+        return {"running": False, "armed": self.armed is not None,
+                "mode": self.armed["mode"] if self.armed else None, "strategies": []}
+
+    def drain(self):
+        return []
+
+    def is_running(self):
+        return False
+
+
+def _install_fake_executor(client):
+    fake = FakeExecutorManager()
+    client.app.state.executor = fake
+    return fake
+
+
+def test_executor_arm_live_requires_confirm(app_client):
+    client, _, cfg = app_client
+    _install_fake_executor(client)
+    sid = _seed_strategy(cfg)
+    r = client.post("/api/executor/arm", json={"strategy_ids": [sid], "mode": "live"})
+    assert r.status_code == 400
+    # with confirm the validation passes (fake manager arms without MT5)
+    ok = client.post(
+        "/api/executor/arm",
+        json={"strategy_ids": [sid], "mode": "live", "confirm_live": True},
+    )
+    assert ok.status_code == 200
+
+
+def test_executor_arm_validation_errors(app_client):
+    client, _, cfg = app_client
+    _install_fake_executor(client)
+    sid = _seed_strategy(cfg)
+    assert client.post("/api/executor/arm", json={"strategy_ids": [sid], "mode": "bogus"}).status_code == 422
+    assert client.post("/api/executor/arm", json={"strategy_ids": [999999], "mode": "dry_run"}).status_code == 404
+    assert client.post("/api/executor/arm", json={"strategy_ids": [], "mode": "dry_run"}).status_code == 422
+
+
+def test_executor_arm_dry_run_builds_runtimes(app_client):
+    client, _, cfg = app_client
+    fake = _install_fake_executor(client)
+    sid = _seed_strategy(cfg)
+    r = client.post(
+        "/api/executor/arm",
+        json={"strategy_ids": [sid], "mode": "dry_run", "preset": "prop_conservative"},
+    )
+    assert r.status_code == 200
+    assert fake.armed is not None
+    assert fake.armed["mode"] == "dry_run"
+    assert len(fake.armed["runtimes"]) == 1
+    assert fake.armed["runtimes"][0].magic == 990_000 + sid
+
+
+def test_executor_stop_and_status(app_client):
+    client, _, cfg = app_client
+    fake = _install_fake_executor(client)
+    assert client.post("/api/executor/stop").json() == {"status": "stopped"}
+    assert fake.stopped is True
+    assert client.get("/api/executor/status").json()["armed"] is False
+
+
 def test_websocket_hello(app_client):
     client, fake, cfg = app_client
     with client.websocket_connect("/ws/events") as ws:

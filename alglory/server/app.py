@@ -26,8 +26,12 @@ from alglory.deploy.mql5 import GUARDRAIL_PRESETS, Guardrails, generate_ea, writ
 from alglory.indicators import atr
 from alglory.evolve.campaign import CampaignConfig
 from alglory.genome import Genome
+from alglory.live.executor import ExecutorError, StrategyRuntime
+from alglory.server.executor_worker import ExecutorManager
 from alglory.server.worker import BusyError, CampaignManager
 from alglory.vault.db import Vault
+
+_EXECUTOR_MAGIC_BASE = 990_000
 
 POLL_INTERVAL = 0.25
 
@@ -36,6 +40,14 @@ class DeployRequest(BaseModel):
     preset: str = "personal"
     custom: dict | None = None
     out_dir: str | None = None
+
+
+class ExecutorArmRequest(BaseModel):
+    strategy_ids: list[int]
+    mode: str = "dry_run"
+    preset: str = "personal"
+    confirm_live: bool = False
+    poll_seconds: float = 5.0
 
 
 def _resolve_deploy_dir(cfg: AppConfig) -> tuple[Path, str, str | None]:
@@ -141,17 +153,22 @@ def create_app(cfg: AppConfig) -> FastAPI:
         # Single drainer: keeps the worker's event queue flowing even with no
         # browser attached (a full pipe would block the worker's exit), and
         # broadcasts every event to all connected sockets.
+        async def broadcast(event):
+            dead = []
+            for sock in app.state.sockets:
+                try:
+                    await sock.send_json(event)
+                except Exception:
+                    dead.append(sock)
+            for sock in dead:
+                app.state.sockets.discard(sock)
+
         async def pump():
             while True:
                 for event in app.state.manager.drain():
-                    dead = []
-                    for sock in app.state.sockets:
-                        try:
-                            await sock.send_json(event)
-                        except Exception:
-                            dead.append(sock)
-                    for sock in dead:
-                        app.state.sockets.discard(sock)
+                    await broadcast(event)
+                for event in app.state.executor.drain():
+                    await broadcast(event)
                 await asyncio.sleep(POLL_INTERVAL)
 
         task = asyncio.create_task(pump())
@@ -161,6 +178,7 @@ def create_app(cfg: AppConfig) -> FastAPI:
     app = FastAPI(title="Alglory", version="0.1.0", lifespan=lifespan)
     app.state.cfg = cfg
     app.state.manager = CampaignManager(cfg.db_path, cfg.data_dir)
+    app.state.executor = ExecutorManager()
     app.state.sockets = set()
 
     def vault() -> Vault:
@@ -241,6 +259,54 @@ def create_app(cfg: AppConfig) -> FastAPI:
         except BusyError as exc:
             raise HTTPException(409, str(exc)) from exc
         return {"status": "resuming", "campaign_id": cid}
+
+    @app.post("/api/executor/arm")
+    def executor_arm(req: ExecutorArmRequest):
+        mode = req.mode.lower()
+        if mode not in ("dry_run", "demo", "live"):
+            raise HTTPException(422, f"Unknown mode {req.mode!r}; valid: dry_run, demo, live.")
+        if mode == "live" and not req.confirm_live:
+            raise HTTPException(400, "Live mode requires confirm_live=true.")
+        if req.preset not in GUARDRAIL_PRESETS:
+            raise HTTPException(
+                422, f"Unknown preset {req.preset!r}; valid: {sorted(GUARDRAIL_PRESETS)}"
+            )
+        if not req.strategy_ids:
+            raise HTTPException(422, "No strategy_ids given.")
+        runtimes = []
+        for sid in req.strategy_ids:
+            row = vault().get_strategy(sid)
+            if row is None:
+                raise HTTPException(404, f"Strategy {sid} not found.")
+            runtimes.append(
+                StrategyRuntime(
+                    genome=Genome.from_json(row["genome_json"]),
+                    symbol=row["symbol"],
+                    timeframe=row["timeframe"],
+                    guard=GUARDRAIL_PRESETS[req.preset],
+                    magic=_EXECUTOR_MAGIC_BASE + sid,
+                )
+            )
+        try:
+            app.state.executor.arm_strategies(
+                runtimes, mode, req.confirm_live, poll_seconds=req.poll_seconds
+            )
+        except BusyError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ExecutorError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except RuntimeError as exc:  # MT5 not installed / not connected
+            raise HTTPException(503, str(exc)) from exc
+        return app.state.executor.status()
+
+    @app.post("/api/executor/stop")
+    def executor_stop():
+        app.state.executor.stop()
+        return {"status": "stopped"}
+
+    @app.get("/api/executor/status")
+    def executor_status():
+        return app.state.executor.status()
 
     @app.get("/api/campaigns")
     def list_campaigns():
