@@ -10,9 +10,13 @@ from __future__ import annotations
 import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
+
+if TYPE_CHECKING:
+    from alglory.analysis.sizing import SymbolSpec
 
 _TF_ATTR = {"M15": "TIMEFRAME_M15", "H1": "TIMEFRAME_H1", "H4": "TIMEFRAME_H4", "D1": "TIMEFRAME_D1"}
 
@@ -26,6 +30,38 @@ class ConnStatus:
     ok: bool
     message: str
     account: str | None = None
+
+
+@dataclass(frozen=True)
+class OrderResult:
+    ok: bool
+    retcode: int
+    message: str
+    ticket: int | None = None
+    price: float = 0.0
+    volume: float = 0.0
+
+
+@dataclass(frozen=True)
+class PositionInfo:
+    ticket: int
+    symbol: str
+    direction: int  # +1 long, -1 short
+    volume: float
+    price_open: float
+    sl: float
+    tp: float
+    magic: int
+    profit: float
+
+
+@dataclass(frozen=True)
+class AccountInfo:
+    login: int
+    balance: float
+    equity: float
+    currency: str
+    is_demo: bool
 
 
 class MT5Source:
@@ -106,6 +142,137 @@ class MT5Source:
         if info is None:
             raise ValueError(f"Symbol {symbol!r} not found in the MT5 terminal.")
         return float(info.spread * info.point)
+
+    # ---- trading (live executor) --------------------------------------
+
+    def account(self) -> AccountInfo:
+        self._require_connection()
+        a = self._mt5.account_info()
+        if a is None:
+            raise MT5NotConnectedError("MT5 returned no account info.")
+        is_demo = a.trade_mode == self._mt5.ACCOUNT_TRADE_MODE_DEMO
+        return AccountInfo(int(a.login), float(a.balance), float(a.equity), a.currency, is_demo)
+
+    def symbol_spec(self, symbol: str) -> SymbolSpec:
+        """Broker contract spec for ``symbol``, ready for sizing.lots_for_risk."""
+        from alglory.analysis.sizing import SymbolSpec
+
+        self._require_connection()
+        info = self._mt5.symbol_info(symbol)
+        if info is None:
+            raise ValueError(f"Symbol {symbol!r} not found in the MT5 terminal.")
+        return SymbolSpec(
+            tick_value=float(info.trade_tick_value),
+            tick_size=float(info.trade_tick_size),
+            min_lot=float(info.volume_min),
+            lot_step=float(info.volume_step),
+            max_lot=float(info.volume_max),
+        )
+
+    def positions(self, magic: int | None = None) -> list[PositionInfo]:
+        self._require_connection()
+        out: list[PositionInfo] = []
+        for p in self._mt5.positions_get() or []:
+            if magic is not None and p.magic != magic:
+                continue
+            direction = 1 if p.type == self._mt5.POSITION_TYPE_BUY else -1
+            out.append(
+                PositionInfo(
+                    int(p.ticket), p.symbol, direction, float(p.volume),
+                    float(p.price_open), float(p.sl), float(p.tp), int(p.magic), float(p.profit),
+                )
+            )
+        return out
+
+    def place_market(
+        self,
+        symbol: str,
+        direction: int,
+        lots: float,
+        *,
+        sl: float = 0.0,
+        tp: float = 0.0,
+        magic: int = 0,
+        comment: str = "ALGLORY",
+    ) -> OrderResult:
+        self._require_connection()
+        tick = self._mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return OrderResult(False, -1, f"No tick available for {symbol!r}.")
+        is_buy = direction == 1
+        price = tick.ask if is_buy else tick.bid
+        request = {
+            "action": self._mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": float(lots),
+            "type": self._mt5.ORDER_TYPE_BUY if is_buy else self._mt5.ORDER_TYPE_SELL,
+            "price": price,
+            "sl": float(sl),
+            "tp": float(tp),
+            "magic": int(magic),
+            "comment": comment,
+            "type_time": self._mt5.ORDER_TIME_GTC,
+            "type_filling": self._mt5.ORDER_FILLING_IOC,
+            "deviation": 20,
+        }
+        return self._interpret(self._mt5.order_send(request), price, float(lots))
+
+    def modify_position(self, symbol: str, magic: int, *, sl: float, tp: float) -> bool:
+        self._require_connection()
+        pos = next((p for p in self.positions(magic) if p.symbol == symbol), None)
+        if pos is None:
+            return False
+        request = {
+            "action": self._mt5.TRADE_ACTION_SLTP,
+            "symbol": symbol,
+            "position": pos.ticket,
+            "sl": float(sl),
+            "tp": float(tp),
+            "magic": int(magic),
+        }
+        res = self._mt5.order_send(request)
+        return res is not None and res.retcode == self._mt5.TRADE_RETCODE_DONE
+
+    def close_position(self, symbol: str, magic: int) -> bool:
+        self._require_connection()
+        pos = next((p for p in self.positions(magic) if p.symbol == symbol), None)
+        if pos is None:
+            return False
+        tick = self._mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return False
+        is_buy = pos.direction == 1
+        # a long is closed by selling at the bid; a short by buying at the ask
+        price = tick.bid if is_buy else tick.ask
+        request = {
+            "action": self._mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "position": pos.ticket,
+            "volume": pos.volume,
+            "type": self._mt5.ORDER_TYPE_SELL if is_buy else self._mt5.ORDER_TYPE_BUY,
+            "price": price,
+            "magic": int(magic),
+            "comment": "ALGLORY close",
+            "type_time": self._mt5.ORDER_TIME_GTC,
+            "type_filling": self._mt5.ORDER_FILLING_IOC,
+            "deviation": 20,
+        }
+        res = self._mt5.order_send(request)
+        return res is not None and res.retcode == self._mt5.TRADE_RETCODE_DONE
+
+    def _interpret(self, res, price: float, lots: float) -> OrderResult:
+        if res is None:
+            code, desc = self._mt5.last_error()
+            return OrderResult(False, int(code), f"order_send failed: {desc}")
+        ok = res.retcode == self._mt5.TRADE_RETCODE_DONE
+        return OrderResult(
+            ok,
+            int(res.retcode),
+            "done" if ok else f"rejected (retcode {res.retcode})",
+            ticket=getattr(res, "order", None),
+            price=price,
+            volume=lots,
+        )
 
     def experts_dir(self) -> Path | None:
         if not self._connected or self._mt5 is None:
