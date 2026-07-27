@@ -81,6 +81,17 @@ def test_campaign_persists_and_vaults(vault, cache):
         assert full["symbol"] == "EURUSD"
 
 
+def test_campaign_scores_robustness_at_insert(vault, cache):
+    events = _run(TINY, vault, cache)
+    vaulted = [e for e in events if e["type"] == "strategy_vaulted"]
+    for e in vaulted:
+        assert "robustness_grade" in e  # event always carries the grade slot
+    if vault.count():
+        for row in vault.list_strategies():
+            assert row["robustness_score"] is not None  # scored at insert, no manual rescore
+            assert row["robustness_grade"] in {"A", "B", "C", "D", "F"}
+
+
 def test_campaign_cancellation(vault, cache):
     events = _run(TINY, vault, cache, stop_after=1)
     finished = events[-1]

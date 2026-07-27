@@ -20,7 +20,7 @@ from alglory.data.cache import BarCache, check_sufficiency
 from alglory.data.sample import generate_bars
 from alglory.evolve.fitness import FitnessConfig, OOSGate
 from alglory.evolve.ga import GAParams, evolve_tribe
-from alglory.genome import TRIBES, Genome
+from alglory.genome import TRIBES, Genome, mutate
 from alglory.vault.db import Vault
 
 SAMPLE_BARS = 6000
@@ -42,6 +42,9 @@ class CampaignConfig(BaseModel):
     min_trades: int = Field(default=30, ge=1)
     dd_cap: float = Field(default=0.35, gt=0.0, le=1.0)
     commission_per_lot: float = Field(default=0.0, ge=0.0)
+    # Retrain/optimize: seed the population from this vaulted strategy's
+    # genome (plus mutants of it) instead of starting from random genomes.
+    seed_strategy_id: int | None = None
 
     @field_validator("timeframe")
     @classmethod
@@ -102,6 +105,14 @@ def _wait_while_paused(
         time.sleep(0.2)
     if not should_stop():
         emit({"type": "log", "line": "campaign resumed"})
+
+
+def _seed_population(genome: Genome, size: int, rng: np.random.Generator) -> list[Genome]:
+    """The optimize starting field: the vaulted genome plus mutants of it."""
+    pop = [genome]
+    while len(pop) < size:
+        pop.append(mutate(genome, rng, rate=0.5))
+    return pop
 
 
 def _resume_state(cfg: CampaignConfig, ckpt: dict) -> tuple[int, int, int, list[Genome] | None]:
@@ -179,6 +190,22 @@ def run_campaign(
         gate = OOSGate()
         ga = GAParams(population=cfg.population, generations=cfg.generations)
 
+        seed_genome, seed_tribe = None, None
+        if cfg.seed_strategy_id is not None:
+            srow = vault.get_strategy(cfg.seed_strategy_id)
+            if srow is None:
+                raise RuntimeError(
+                    f"Strategy {cfg.seed_strategy_id} is not in the vault; cannot optimize."
+                )
+            seed_genome = Genome.from_json(srow["genome_json"])
+            seed_tribe = srow["tribe"]
+            emit(
+                {
+                    "type": "log",
+                    "line": f"optimizing {srow['name']}: population seeded from its genome",
+                }
+            )
+
         for s_idx, symbol in enumerate(cfg.symbols):
             if s_idx < sym_start:
                 continue
@@ -207,6 +234,13 @@ def run_campaign(
                     raise _Cancelled()
                 emit({"type": "log", "line": f"breeding tribe '{tribe}' on {symbol}"})
                 seed = (cfg.seed if cfg.seed is not None else int(time.time())) + t_idx * 1000
+                initial = None
+                if is_resumed_tribe:
+                    initial = resume_pop
+                elif seed_genome is not None and tribe == seed_tribe:
+                    initial = _seed_population(
+                        seed_genome, cfg.population, np.random.default_rng(seed)
+                    )
                 for result in evolve_tribe(
                     tribe,
                     bars_is,
@@ -240,6 +274,21 @@ def run_campaign(
                             equity=oos_equity,
                             campaign_id=campaign_id,
                         )
+                        # score walk-forward robustness at insert so the vault
+                        # ranks new strategies without a manual rescore. Scored
+                        # on the full series; best-effort — never break vaulting.
+                        grade = None
+                        try:
+                            from alglory.analysis.robustness import robustness
+
+                            r = robustness(
+                                genome, bars, costs,
+                                BARS_PER_YEAR[cfg.timeframe], timeframe=cfg.timeframe,
+                            )
+                            vault.set_robustness(sid, r["grade"], r["score"])
+                            grade = r["grade"]
+                        except Exception:  # noqa: BLE001 - scoring must not abort a campaign
+                            pass
                         vaulted_total += 1
                         row = vault.get_strategy(sid)
                         emit(
@@ -250,6 +299,7 @@ def run_campaign(
                                 "tribe": tribe,
                                 "symbol": symbol,
                                 "oos_net_profit": oos_m.net_profit,
+                                "robustness_grade": grade,
                             }
                         )
 
