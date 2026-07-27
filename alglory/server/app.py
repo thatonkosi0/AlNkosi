@@ -364,6 +364,18 @@ def create_app(cfg: AppConfig) -> FastAPI:
             raise HTTPException(404, f"Strategy {sid} not found.")
         return {"status": "deleted"}
 
+    @app.post("/api/vault/rescore")
+    def vault_rescore(symbol: str, timeframe: str):
+        """Recompute + persist walk-forward robustness for a symbol/timeframe so
+        the vault can rank by trustworthiness instead of the overfit-prone OOS
+        metric. Uses cached bars; may take a while for a large set."""
+        from alglory.analysis.robustness import rescore_vault
+        from alglory.evolve.campaign import BARS_PER_YEAR
+
+        if timeframe not in BARS_PER_YEAR:
+            raise HTTPException(422, f"Unknown timeframe {timeframe!r}; valid: {sorted(BARS_PER_YEAR)}")
+        return rescore_vault(vault(), BarCache(cfg.data_dir), symbol, timeframe, BARS_PER_YEAR[timeframe])
+
     @app.get("/api/insights")
     def insights():
         return vault().insights()

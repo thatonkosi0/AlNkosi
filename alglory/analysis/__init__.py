@@ -6,6 +6,7 @@ from .parity import (
     python_summary,
 )
 from .portfolio import portfolio_report
+from .robustness import rescore_vault, robustness
 from .walkforward import walk_forward_matrix
 
 __all__ = [
@@ -15,6 +16,8 @@ __all__ = [
     "parse_mt5_html_report",
     "portfolio_report",
     "python_summary",
+    "rescore_vault",
+    "robustness",
     "trade_activity",
     "walk_forward_matrix",
 ]

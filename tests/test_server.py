@@ -209,6 +209,25 @@ def test_insights(app_client):
     assert body["by_tribe"][0]["key"] == "trend"
 
 
+def test_vault_rescore_and_robustness_sort(app_client):
+    from alglory.data.cache import BarCache
+    from alglory.data.sample import generate_bars
+
+    client, fake, cfg = app_client
+    BarCache(cfg.data_dir).save("EURUSD", "H1", generate_bars("EURUSD", "H1", 3000, seed=7))
+    sid = _seed_strategy(cfg)
+
+    out = client.post("/api/vault/rescore?symbol=EURUSD&timeframe=H1").json()
+    assert out["scored"] >= 1
+
+    ranked = client.get("/api/vault?sort=robustness_score").json()
+    scored = next(r for r in ranked if r["id"] == sid)
+    assert scored["robustness_score"] is not None
+    assert scored["robustness_grade"] in {"A", "B", "C", "D", "F"}
+    # unknown timeframe is rejected
+    assert client.post("/api/vault/rescore?symbol=EURUSD&timeframe=ZZ").status_code == 422
+
+
 def test_deploy_writes_file(app_client):
     client, fake, cfg = app_client
     sid = _seed_strategy(cfg)

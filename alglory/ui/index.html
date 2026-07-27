@@ -126,7 +126,8 @@
           <option value="momentum">MOMENTUM</option>
         </select>
         <select id="vf-sort">
-          <option value="oos_net_profit">OOS PROFIT</option>
+          <option value="robustness_score">ROBUSTNESS ★</option>
+          <option value="oos_net_profit" selected>OOS PROFIT</option>
           <option value="oos_profit_factor">OOS PF</option>
           <option value="oos_sharpe">OOS SHARPE</option>
           <option value="oos_max_drawdown">OOS DD</option>
@@ -136,11 +137,12 @@
         <input type="number" id="vf-minpf" placeholder="MIN PF" step="0.1" min="0" title="minimum OOS profit factor">
         <input type="number" id="vf-maxdd" placeholder="MAX DD %" step="1" min="0" title="maximum OOS drawdown, percent">
         <button id="vf-apply" class="pill">FILTER</button>
+        <button id="vf-rescore" class="pill" title="recompute walk-forward robustness for a symbol/timeframe">RESCORE ★</button>
       </div>
       <table class="vault-table" id="vault-table">
         <thead><tr>
           <th>NAME</th><th>TRIBE</th><th>SYMBOL</th><th>TF</th>
-          <th>OOS PROFIT</th><th>PF</th><th>DD</th><th>SHARPE</th><th>TRADES</th>
+          <th>OOS PROFIT</th><th>PF</th><th>DD</th><th>SHARPE</th><th>TRADES</th><th>ROBUST</th>
         </tr></thead>
         <tbody></tbody>
       </table>

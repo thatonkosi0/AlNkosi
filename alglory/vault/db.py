@@ -27,6 +27,8 @@ _SORTABLE = {f"{p}_{k}" for p in ("is", "oos") for k in _METRIC_KEYS} | {
     "tribe",
     "symbol",
     "timeframe",
+    "robustness_score",
+    "robustness_grade",
 }
 
 # Metric-range filters accepted by list_strategies: name -> (column, operator).
@@ -51,6 +53,8 @@ CREATE TABLE IF NOT EXISTS strategies (
     equity_blob BLOB,
     campaign_id INTEGER,
     created_at TEXT DEFAULT (datetime('now')),
+    robustness_grade TEXT,
+    robustness_score REAL,
     {metric_cols}
 );
 CREATE TABLE IF NOT EXISTS campaigns (
@@ -85,6 +89,15 @@ class Vault:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as con:
             con.executescript(_SCHEMA)
+            self._migrate(con)
+
+    @staticmethod
+    def _migrate(con: sqlite3.Connection) -> None:
+        """Add columns introduced after a DB was first created (idempotent)."""
+        existing = {r["name"] for r in con.execute("PRAGMA table_info(strategies)")}
+        for col, decl in (("robustness_grade", "TEXT"), ("robustness_score", "REAL")):
+            if col not in existing:
+                con.execute(f"ALTER TABLE strategies ADD COLUMN {col} {decl}")
 
     def _conn(self) -> sqlite3.Connection:
         con = sqlite3.connect(self._path, timeout=30)
@@ -163,11 +176,19 @@ class Vault:
         with self._conn() as con:
             rows = con.execute(
                 f"SELECT id, name, tribe, symbol, timeframe, campaign_id, created_at, "
+                f"robustness_grade, robustness_score, "
                 f"{sortable_cols} FROM strategies {clause} "
                 f"ORDER BY {sort} {order} LIMIT ?",
                 (*params, limit),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def set_robustness(self, sid: int, grade: str | None, score: float | None) -> None:
+        with self._conn() as con:
+            con.execute(
+                "UPDATE strategies SET robustness_grade = ?, robustness_score = ? WHERE id = ?",
+                (grade, None if score is None else float(score), sid),
+            )
 
     def get_strategy(self, sid: int) -> dict | None:
         with self._conn() as con:

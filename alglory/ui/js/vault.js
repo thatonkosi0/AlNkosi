@@ -6,6 +6,14 @@ const NUM = (x) => (x === null || x === undefined ? "-" : x.toFixed(2));
 
 function cls(x) { return x >= 0 ? "pos" : "neg"; }
 
+function robustCell(r) {
+  const g = r.robustness_grade;
+  if (!g) return `<span title="not scored yet — click RESCORE">-</span>`;
+  const color = g === "A" || g === "B" ? "pos" : g === "D" || g === "F" ? "neg" : "";
+  const score = r.robustness_score == null ? "" : ` ${r.robustness_score.toFixed(2)}`;
+  return `<span class="${color}" title="walk-forward robustness score">${g}${score}</span>`;
+}
+
 export async function refreshVault() {
   const params = new URLSearchParams();
   const symbol = document.getElementById("vf-symbol").value.trim();
@@ -32,7 +40,8 @@ export async function refreshVault() {
       <td>${NUM(r.oos_profit_factor)}</td>
       <td>${PCT(r.oos_max_drawdown)}</td>
       <td>${NUM(r.oos_sharpe)}</td>
-      <td>${r.oos_trades}</td>`;
+      <td>${r.oos_trades}</td>
+      <td>${robustCell(r)}</td>`;
     tr.addEventListener("click", () => showDetail(r.id));
     tbody.appendChild(tr);
   }
@@ -158,5 +167,27 @@ export function initVault() {
     refreshVault().catch((e) => toast(e.message)));
   document.getElementById("detail-close").addEventListener("click", () => {
     document.getElementById("vault-detail").hidden = true;
+  });
+  document.getElementById("vf-rescore").addEventListener("click", async () => {
+    const symbol = document.getElementById("vf-symbol").value.trim().toUpperCase();
+    if (!symbol) { toast("Set a SYMBOL filter first (e.g. EURUSD)."); return; }
+    const tf = prompt("Timeframe to rescore (M15 / H1 / H4 / D1):", "H1");
+    if (!tf) return;
+    toast("Rescoring — walk-forward across the vault. This can take a minute…");
+    try {
+      const out = await api(
+        `/api/vault/rescore?symbol=${symbol}&timeframe=${tf.trim().toUpperCase()}`,
+        { method: "POST" }
+      );
+      if (!out.scored) {
+        toast(out.reason || "Nothing scored — no cached bars for that symbol/timeframe.");
+        return;
+      }
+      toast(`Rescored ${out.scored} strateg${out.scored === 1 ? "y" : "ies"}. Sort by ROBUSTNESS ★ to rank them.`);
+      document.getElementById("vf-sort").value = "robustness_score";
+      refreshVault().catch((e) => toast(e.message));
+    } catch (err) {
+      toast(err.message);
+    }
   });
 }
