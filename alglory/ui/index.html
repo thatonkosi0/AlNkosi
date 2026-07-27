@@ -13,6 +13,7 @@
     <a href="#deck" data-tab="deck" class="tab active">DECK</a>
     <a href="#control" data-tab="control" class="tab">CONTROL</a>
     <a href="#vault" data-tab="vault" class="tab">VAULT</a>
+    <a href="#executor" data-tab="executor" class="tab">EXECUTOR</a>
     <a href="#map" data-tab="map" class="tab">MAP</a>
     <a href="#insights" data-tab="insights" class="tab">INSIGHTS</a>
   </nav>
@@ -148,6 +149,62 @@
     <div class="panel" id="vault-detail" hidden>
       <div class="panel-title">STRATEGY DETAIL <button id="detail-close" class="pill">✕</button></div>
       <div id="detail-body"></div>
+    </div>
+  </section>
+
+  <section id="tab-executor" class="tab-panel">
+    <div class="panel">
+      <div class="panel-title">LIVE EXECUTOR
+        <span class="map-hint">trades vaulted strategies via order_send — demo-first, you arm it</span>
+      </div>
+      <form id="executor-form" class="control-form">
+        <label>STRATEGY IDS
+          <input type="text" name="strategy_ids" placeholder="e.g. 52, 41, 120" title="comma-separated vault ids">
+        </label>
+        <label>MODE
+          <select name="mode" id="exec-mode">
+            <option value="dry_run" selected>DRY RUN (log only)</option>
+            <option value="demo">DEMO (demo account only)</option>
+            <option value="live">LIVE (real orders)</option>
+          </select>
+        </label>
+        <label>PRESET
+          <select name="preset">
+            <option value="personal" selected>PERSONAL</option>
+            <option value="prop_conservative">PROP CONSERVATIVE</option>
+            <option value="prop_aggressive">PROP AGGRESSIVE</option>
+          </select>
+        </label>
+        <label>POLL (seconds) <input type="number" name="poll_seconds" value="5" min="1" step="1"></label>
+        <label>MAX OPEN POSITIONS
+          <input type="number" name="max_open_positions" placeholder="unlimited" min="1"
+                 title="global cap across all armed strategies">
+        </label>
+        <label id="confirm-live-wrap" hidden>
+          <input type="checkbox" name="confirm_live"> I UNDERSTAND — ARM LIVE TRADING
+        </label>
+        <div id="live-warning" class="error-box" hidden>
+          LIVE mode places REAL orders on your account. You are arming this yourself;
+          ALGLORY is research software, not financial advice.
+        </div>
+        <div class="control-actions">
+          <button type="submit" id="arm-btn" class="btn-primary">▶ ARM EXECUTOR</button>
+          <button type="button" id="kill-btn" class="btn-danger" disabled>■ KILL (flatten + halt)</button>
+        </div>
+      </form>
+      <div id="executor-error" class="error-box" hidden></div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">EXECUTOR STATUS</div>
+      <table class="vault-table" id="executor-status-table">
+        <thead><tr><th>MAGIC</th><th>SYMBOL</th><th>OPEN</th><th>HALTED</th><th>PEAK EQ</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div id="executor-idle" class="empty-note">EXECUTOR IDLE — ARM IT ABOVE.</div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">INTENT FEED</div>
+      <pre id="executor-terminal" class="terminal terminal-tall"></pre>
     </div>
   </section>
 

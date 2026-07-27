@@ -2,6 +2,7 @@
 import { initDeck, deckHandleEvent } from "/js/deck.js";
 import { initControl, controlHandleEvent } from "/js/control.js";
 import { initVault, refreshVault } from "/js/vault.js";
+import { initExecutor, executorHandleEvent, refreshExecutorStatus } from "/js/executor.js";
 import { initMap, refreshMap } from "/js/map.js";
 import { initInsights, refreshInsights } from "/js/insights.js";
 
@@ -42,7 +43,9 @@ export function toast(msg, ms = 5000) {
 }
 
 // ---- Tab router ------------------------------------------------------
-const REFRESHERS = { vault: refreshVault, map: refreshMap, insights: refreshInsights };
+const REFRESHERS = {
+  vault: refreshVault, executor: refreshExecutorStatus, map: refreshMap, insights: refreshInsights,
+};
 function showTab(name) {
   document.querySelectorAll(".tab").forEach((t) =>
     t.classList.toggle("active", t.dataset.tab === name));
@@ -64,6 +67,7 @@ function connectWS() {
     const event = JSON.parse(msg.data);
     deckHandleEvent(event);
     controlHandleEvent(event);
+    executorHandleEvent(event);
     if (event.type === "campaign_finished") {
       refreshVault().catch(() => {});
       toast(`Campaign ${event.status}${event.error ? ": " + event.error : ""} — ${event.vaulted_total} strategies vaulted`);
@@ -100,6 +104,7 @@ window.addEventListener("hashchange", routeFromHash);
 initDeck();
 initControl();
 initVault();
+initExecutor();
 initMap();
 initInsights();
 routeFromHash();
