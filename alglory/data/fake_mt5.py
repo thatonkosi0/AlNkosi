@@ -48,6 +48,25 @@ class FakeMT5Source:
     def set_price(self, price: float) -> None:
         self._price = price
 
+    def mark_price(self, price: float) -> list[int]:
+        """Advance the market to ``price`` and close any position whose SL/TP is
+        crossed, mirroring what a real broker does between bars. Returns the
+        tickets closed."""
+        self._price = price
+        closed: list[int] = []
+        for p in list(self._positions):
+            hit_sl = p.sl > 0 and (
+                (p.direction == 1 and price <= p.sl) or (p.direction == -1 and price >= p.sl)
+            )
+            hit_tp = p.tp > 0 and (
+                (p.direction == 1 and price >= p.tp) or (p.direction == -1 and price <= p.tp)
+            )
+            if hit_sl or hit_tp:
+                self._positions.remove(p)
+                closed.append(p.ticket)
+                self.orders.append(("broker_exit", p.symbol, p.magic))
+        return closed
+
     def account(self) -> AccountInfo:
         return AccountInfo(0, self._balance, self._equity, self._currency, self._is_demo)
 
