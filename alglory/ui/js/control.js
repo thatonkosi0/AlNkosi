@@ -3,6 +3,27 @@ import { api, toast, fxMode } from "/js/app.js";
 
 let terminal, launchBtn, cancelBtn, pauseBtn, resumeLastBtn, errorBox;
 let isPaused = false;
+let seedStrategyId = null;
+
+function clearOptimize() {
+  seedStrategyId = null;
+  document.getElementById("optimize-banner").hidden = true;
+}
+
+// Triggered by the VAULT tab (via an alglory:optimize event) to pre-fill the
+// form for optimizing a vaulted strategy — decoupled so there's no import cycle.
+function prefillOptimize(row) {
+  const form = document.getElementById("campaign-form");
+  form.elements["symbols"].value = row.symbol;
+  form.elements["timeframe"].value = row.timeframe;
+  form.querySelectorAll('input[name="tribes"]').forEach((cb) => {
+    cb.checked = cb.value === row.tribe;
+  });
+  seedStrategyId = row.id;
+  document.getElementById("optimize-name").textContent = `${row.name} (${row.symbol} ${row.timeframe})`;
+  document.getElementById("optimize-banner").hidden = false;
+  location.hash = "#control";
+}
 let typeQueue = [];
 let typing = false;
 
@@ -89,6 +110,8 @@ export function initControl() {
   pauseBtn = document.getElementById("pause-btn");
   resumeLastBtn = document.getElementById("resume-last-btn");
   errorBox = document.getElementById("control-error");
+  document.getElementById("optimize-clear").addEventListener("click", clearOptimize);
+  document.addEventListener("alglory:optimize", (e) => prefillOptimize(e.detail));
 
   document.getElementById("campaign-form").addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -113,9 +136,11 @@ export function initControl() {
       commission_per_lot: Number(form.get("commission_per_lot")) || 0,
     };
     if (form.get("seed")) payload.seed = Number(form.get("seed"));
+    if (seedStrategyId != null) payload.seed_strategy_id = seedStrategyId;
     try {
       await api("/api/campaigns", { method: "POST", body: JSON.stringify(payload) });
       setRunning(true);
+      clearOptimize();
       location.hash = "#deck";
     } catch (err) {
       errorBox.textContent = err.message;

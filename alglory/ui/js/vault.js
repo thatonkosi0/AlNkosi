@@ -116,6 +116,7 @@ async function showDetail(sid) {
     <canvas id="detail-spark" height="120"></canvas>
     <div class="control-actions">
       <button class="btn-primary" id="deploy-btn">⇪ DEPLOY TO MT5</button>
+      <button class="pill" id="optimize-btn" title="breed a new campaign seeded from this genome">★ OPTIMIZE</button>
       <button class="btn-danger" id="delete-btn">✕ DELETE</button>
     </div>
     <div id="deploy-result" class="terminal" style="height:auto;min-height:40px;margin-top:10px" hidden></div>`;
@@ -123,6 +124,15 @@ async function showDetail(sid) {
   drawSparkline(document.getElementById("detail-spark"), row.equity);
 
   document.getElementById("deploy-btn").addEventListener("click", () => deployFlow(sid));
+  document.getElementById("optimize-btn").addEventListener("click", () => {
+    document.dispatchEvent(new CustomEvent("alglory:optimize", {
+      detail: {
+        id: row.id, name: row.name, symbol: row.symbol,
+        timeframe: row.timeframe, tribe: row.tribe,
+      },
+    }));
+    toast(`Optimize seeded from ${row.name} — pick a data source and LAUNCH.`);
+  });
   document.getElementById("delete-btn").addEventListener("click", async () => {
     if (!confirm(`Delete ${row.name} permanently?`)) return;
     await api(`/api/vault/${sid}`, { method: "DELETE" });

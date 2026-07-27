@@ -92,6 +92,19 @@ def test_campaign_start_and_busy(app_client):
     assert r2.status_code == 409
 
 
+def test_campaign_accepts_seed_strategy_id(app_client):
+    # the OPTIMIZE trigger posts a normal campaign config plus seed_strategy_id;
+    # it must flow through to the manager so the population seeds from that genome
+    client, fake, cfg = app_client
+    payload = {
+        "symbols": ["EURUSD"], "tribes": ["trend"],
+        "population": 8, "generations": 2, "seed_strategy_id": 42,
+    }
+    r = client.post("/api/campaigns", json=payload)
+    assert r.status_code == 202
+    assert fake.started_with.seed_strategy_id == 42
+
+
 def test_campaign_validation_error(app_client):
     client, fake, cfg = app_client
     r = client.post("/api/campaigns", json={"symbols": [], "tribes": ["trend"]})
