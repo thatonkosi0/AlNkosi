@@ -108,6 +108,24 @@ def test_ea_normalizes_stop_prices():
     assert "NormalizeDouble" in code
 
 
+def test_ea_has_min_lot_fallback_so_small_accounts_still_trade():
+    # The backtester ignores the broker minimum lot; the live EA must not
+    # silently place nothing when risk-sizing rounds below it. It should fall
+    # back to the minimum lot, bounded by a per-trade risk cap.
+    code = _gen(
+        Genome(
+            "trend", "both",
+            SignalGene("ma_cross", {"fast": 12, "slow": 48}),
+            FILTERS, MGMT, RiskGene(0.01),
+        )
+    )
+    assert "InpMinLotFallback = true" in code
+    assert "InpMaxRiskPct" in code
+    assert "minLotRisk" in code  # the fallback computes and caps min-lot risk
+    # brace balance is still intact after the rewrite
+    assert code.count("{") == code.count("}")
+
+
 def test_ea_reports_rejected_orders():
     code = _gen(
         Genome(

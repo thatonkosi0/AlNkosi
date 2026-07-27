@@ -11,9 +11,19 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import numpy as np
+
+from alglory.analysis.sizing import (
+    DEFAULT_MAX_RISK_PCT,
+    EURUSD_STD,
+    min_account_for_risk_sizing,
+    min_account_to_trade,
+)
 from alglory.config import AppConfig
+from alglory.data.cache import BarCache
 from alglory.data.mt5source import MT5Source
 from alglory.deploy.mql5 import GUARDRAIL_PRESETS, Guardrails, generate_ea, write_ea
+from alglory.indicators import atr
 from alglory.evolve.campaign import CampaignConfig
 from alglory.genome import Genome
 from alglory.server.worker import BusyError, CampaignManager
@@ -26,6 +36,103 @@ class DeployRequest(BaseModel):
     preset: str = "personal"
     custom: dict | None = None
     out_dir: str | None = None
+
+
+def _resolve_deploy_dir(cfg: AppConfig) -> tuple[Path, str, str | None]:
+    """Pick where the EA is written and report how that decision was made.
+
+    Returns (out_dir, target, reason). ``target`` is ``"mt5"`` when the file
+    lands in the live terminal's Experts folder, or ``"fallback"`` when MT5
+    could not be located and we wrote to ``exports`` instead. ``reason`` carries
+    the actionable explanation for a fallback (None on success).
+    """
+    src = MT5Source()
+    if not src.available():
+        reason = (
+            "The MetaTrader5 Python package is not installed, so the MT5 Experts "
+            "folder can't be located. Install it with: pip install alglory[mt5] "
+            "(Windows only), then start MetaTrader 5 and deploy again."
+        )
+        return cfg.data_dir / "exports", "fallback", reason
+
+    conn = src.connect()
+    if not conn.ok:
+        return cfg.data_dir / "exports", "fallback", conn.message
+
+    experts = src.experts_dir()
+    if experts is None:
+        reason = (
+            "MetaTrader 5 is connected but its terminal data path could not be "
+            "read, so the Experts folder is unknown."
+        )
+        return cfg.data_dir / "exports", "fallback", reason
+
+    return experts, "mt5", None
+
+
+def _sizing_note(cfg: AppConfig, row: dict, genome: Genome, guard: Guardrails) -> tuple[float | None, str]:
+    """Estimate the account size needed for this strategy to actually place trades.
+
+    Uses the cached history's median ATR to turn the genome's ATR-multiple stop
+    into a currency distance, then mirrors the EA's sizing. Best-effort: if no
+    bars are cached we return a generic pointer instead of a number.
+    """
+    generic = (
+        "Position size is risk-based off your live balance, and the min-lot "
+        "fallback (InpMinLotFallback, ON by default) trades the broker minimum "
+        "lot when risk-sizing would round to zero — so the strategy still fires "
+        "on a modest account. If you still see no trades, open MT5 Toolbox > "
+        "Experts/Journal; the EA logs exactly why."
+    )
+    try:
+        bars = BarCache(cfg.data_dir).load(row["symbol"], row["timeframe"])
+    except Exception:
+        bars = None
+    if bars is None or len(bars) < 50:
+        return None, generic
+
+    med_atr = float(
+        np.nanmedian(
+            atr(bars["high"].to_numpy(), bars["low"].to_numpy(), bars["close"].to_numpy(), 14)
+        )
+    )
+    sl_dist = genome.management.sl_atr * med_atr
+    if sl_dist <= 0:
+        return None, generic
+    floor = min_account_to_trade(sl_dist, EURUSD_STD, max_risk_pct=DEFAULT_MAX_RISK_PCT)
+    risk_based = min_account_for_risk_sizing(guard.risk_pct, sl_dist, EURUSD_STD)
+    note = (
+        f"Estimated sizing ({row['symbol']} {row['timeframe']}, standard-lot): the "
+        f"strategy trades the broker minimum lot from about {floor:,.0f}, and sizes "
+        f"fully by its {guard.risk_pct:.2%} risk from about {risk_based:,.0f} (account "
+        f"currency). Below ~{floor:,.0f} the EA refuses and logs the balance needed. "
+        f"Min-lot fallback is ON so a modest account still trades."
+    )
+    return floor, note
+
+
+def _deploy_instructions(path: Path, name: str, row: dict, target: str, reason: str | None) -> str:
+    if target == "fallback":
+        return (
+            f"MT5 was not detected, so the EA was NOT placed in your MetaTrader "
+            f"Experts folder. {reason} It was saved to {path} instead. To use it: "
+            f"either start MetaTrader 5 (logged in) and click DEPLOY again, or "
+            f"manually copy {path.name} into your terminal's MQL5/Experts folder, "
+            f"then open it in MetaEditor (F4) and compile with F7."
+        )
+    where = (
+        "your MT5 Experts folder"
+        if target == "mt5"
+        else f"the folder you chose ({path.parent})"
+    )
+    return (
+        f"EA written into {where}. "
+        f"1. Open MetaEditor (F4 in MT5) and open {path.name}. "
+        "2. Compile with F7. "
+        f"3. In MT5, open a {row['symbol']} {row['timeframe']} chart and drag "
+        f"{name} from Navigator > Expert Advisors onto it. "
+        "4. Enable Algo Trading. The EA enforces its guardrails automatically."
+    )
 
 
 def create_app(cfg: AppConfig) -> FastAPI:
@@ -219,23 +326,22 @@ def create_app(cfg: AppConfig) -> FastAPI:
             guardrails=guard,
         )
         if req.out_dir:
-            out_dir = Path(req.out_dir)
+            out_dir, target, reason = Path(req.out_dir), "custom", None
         else:
-            src = MT5Source()
-            experts = None
-            if src.available() and src.connect().ok:
-                experts = src.experts_dir()
-            out_dir = experts if experts else cfg.data_dir / "exports"
+            out_dir, target, reason = _resolve_deploy_dir(cfg)
         path = write_ea(code, name, out_dir)
+        min_account, sizing_note = _sizing_note(cfg, row, genome, guard)
         return {
             "path": str(path),
-            "instructions": (
-                f"1. Open MetaEditor (F4 in MT5) and open {path.name}. "
-                "2. Compile with F7. "
-                f"3. In MT5, open a {row['symbol']} {row['timeframe']} chart and drag "
-                f"{name} from Navigator > Expert Advisors onto it. "
-                "4. Enable Algo Trading. The EA enforces its guardrails automatically."
-            ),
+            "target": target,
+            "mt5_detected": target == "mt5",
+            "reason": reason,
+            "min_account_estimate": min_account,
+            "min_lot_fallback": True,
+            "sizing_note": sizing_note,
+            "instructions": _deploy_instructions(path, name, row, target, reason)
+            + " "
+            + sizing_note,
         }
 
     @app.websocket("/ws/events")

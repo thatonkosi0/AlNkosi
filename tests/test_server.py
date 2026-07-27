@@ -225,6 +225,93 @@ def test_deploy_writes_file(app_client):
     assert client.post(f"/api/deploy/{sid}", json={"preset": "nope"}).status_code == 422
 
 
+def test_deploy_reports_mt5_fallback(app_client, monkeypatch):
+    # When MT5 can't be located, deploy must fall back to the exports folder —
+    # and SAY SO instead of implying an MT5 success. Patched so the result does
+    # not depend on whether the test machine happens to have MT5 installed.
+    import alglory.server.app as appmod
+
+    class _NoMT5:
+        def available(self):
+            return False
+
+    monkeypatch.setattr(appmod, "MT5Source", _NoMT5)
+    client, fake, cfg = app_client
+    sid = _seed_strategy(cfg)
+    body = client.post(f"/api/deploy/{sid}", json={"preset": "personal"}).json()
+    assert body["target"] == "fallback"
+    assert body["mt5_detected"] is False
+    assert "exports" in body["path"].replace("\\", "/")
+    assert "MetaTrader5" in body["reason"] or "MT5" in body["reason"]
+    assert "not detected" in body["instructions"].lower()
+
+
+def test_deploy_targets_mt5_when_connected(app_client, monkeypatch, tmp_path):
+    import alglory.server.app as appmod
+    from alglory.data.mt5source import ConnStatus
+
+    experts = tmp_path / "Terminal" / "MQL5" / "Experts" / "Alglory"
+    experts.mkdir(parents=True)
+
+    class _LiveMT5:
+        def available(self):
+            return True
+
+        def connect(self):
+            return ConnStatus(ok=True, message="Connected to MetaTrader 5.")
+
+        def experts_dir(self):
+            return experts
+
+    monkeypatch.setattr(appmod, "MT5Source", _LiveMT5)
+    client, fake, cfg = app_client
+    sid = _seed_strategy(cfg)
+    body = client.post(f"/api/deploy/{sid}", json={"preset": "personal"}).json()
+    assert body["target"] == "mt5"
+    assert body["mt5_detected"] is True
+    assert body["reason"] is None
+    assert body["path"].replace("\\", "/").startswith(str(experts).replace("\\", "/"))
+
+
+def test_deploy_surfaces_min_lot_fallback_and_account(app_client):
+    client, fake, cfg = app_client
+    sid = _seed_strategy(cfg)
+    body = client.post(f"/api/deploy/{sid}", json={"preset": "personal"}).json()
+    assert body["min_lot_fallback"] is True
+    assert "fallback" in body["sizing_note"].lower()
+    # the generated EA carries the fallback so a small account still trades
+    from pathlib import Path
+
+    code = Path(body["path"]).read_text(encoding="utf-8")
+    assert "InpMinLotFallback = true" in code
+
+
+def test_deploy_estimates_min_account_when_bars_cached(app_client):
+    import numpy as np
+
+    from alglory.data.cache import BarCache
+    from alglory.data.sample import generate_bars
+
+    client, fake, cfg = app_client
+    BarCache(cfg.data_dir).save("EURUSD", "H1", generate_bars("EURUSD", "H1", 2000, seed=7))
+    sid = _seed_strategy(cfg)
+    body = client.post(f"/api/deploy/{sid}", json={"preset": "personal"}).json()
+    assert body["min_account_estimate"] is not None
+    assert body["min_account_estimate"] > 0
+    assert np.isfinite(body["min_account_estimate"])
+
+
+def test_deploy_custom_out_dir_marks_target(app_client, tmp_path):
+    client, fake, cfg = app_client
+    sid = _seed_strategy(cfg)
+    dest = tmp_path / "custom_out"
+    body = client.post(
+        f"/api/deploy/{sid}", json={"preset": "personal", "out_dir": str(dest)}
+    ).json()
+    assert body["target"] == "custom"
+    assert body["path"].replace("\\", "/").startswith(str(dest).replace("\\", "/"))
+
+
 def test_websocket_hello(app_client):
     client, fake, cfg = app_client
     with client.websocket_connect("/ws/events") as ws:

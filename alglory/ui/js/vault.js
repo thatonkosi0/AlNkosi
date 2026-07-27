@@ -138,8 +138,15 @@ async function deployFlow(sid) {
       body: JSON.stringify({ preset: preset.trim() }),
     });
     out.hidden = false;
-    out.textContent = `EA written to:\n${res.path}\n\n${res.instructions}`;
-    toast("EA generated — compile it in MetaEditor (F7).");
+    const where = res.mt5_detected
+      ? "MT5 Experts folder (Navigator > Expert Advisors > Alglory)"
+      : "a fallback folder — MT5 was NOT detected";
+    out.textContent = `EA written to ${where}:\n${res.path}\n\n${res.instructions}`;
+    toast(
+      res.mt5_detected
+        ? "EA in MT5 — compile it in MetaEditor (F7)."
+        : "MT5 not detected — EA saved to fallback folder (see details)."
+    );
   } catch (err) {
     out.hidden = false;
     out.textContent = `DEPLOY FAILED: ${err.message}`;

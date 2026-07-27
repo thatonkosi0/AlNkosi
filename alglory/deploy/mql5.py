@@ -192,6 +192,8 @@ input long   InpMagic = 990117;
 input double InpRiskPct = {_flt(guardrails.risk_pct)};      // risk per trade (fraction of balance)
 input double InpDailyLossPct = {_flt(guardrails.daily_loss_pct)}; // daily loss halt (fraction)
 input double InpMaxDDPct = {_flt(guardrails.max_dd_pct)};    // max drawdown permanent halt (fraction)
+input bool   InpMinLotFallback = true;  // if risk-size rounds below the broker min lot, trade the min lot so the strategy still fires (bounded by InpMaxRiskPct)
+input double InpMaxRiskPct = 0.05;      // per-trade risk ceiling for the min-lot fallback; below this the account is refused loudly, not blown up
 input double InpSLAtr = {_flt(g.management.sl_atr)};       // stop loss in ATR multiples
 input double InpTPAtr = {_flt(g.management.tp_atr)};       // take profit in ATR multiples
 input bool   InpUseTrail = {"true" if use_trail else "false"};
@@ -218,6 +220,7 @@ datetime gLastBar = 0;
 datetime gEntryBar = 0;
 double gEntryAtr = 0.0;
 bool gBeArmed = false;
+bool gMinLotWarned = false;
 
 int OnInit()
 {{
@@ -334,7 +337,30 @@ double LotsForRisk(double slDistance)
    lots = MathFloor(lots / step) * step;
    if(lots < minLot)
    {{
-      Print("ALGLORY: account too small for the chosen risk on this symbol.");
+      // Risk-based size is below the broker minimum. Rather than silently never
+      // trading on a small account, optionally fall back to the minimum lot so
+      // the strategy still fires — but only while that minimum-lot trade stays
+      // within InpMaxRiskPct, so a too-small account is refused loudly, not
+      // quietly blown up.
+      if(InpMinLotFallback)
+      {{
+         double minLotRisk = minLot * lossPerLot / balance;
+         if(minLotRisk <= InpMaxRiskPct)
+         {{
+            if(!gMinLotWarned)
+            {{
+               PrintFormat("ALGLORY: risk-based size below broker min; trading min lot %.2f (%.1f%% risk this trade).",
+                           minLot, minLotRisk * 100.0);
+               gMinLotWarned = true;
+            }}
+            return minLot;
+         }}
+         PrintFormat("ALGLORY: account too small — even min lot %.2f risks %.1f%% (cap %.1f%%). Fund to about %.0f %s to trade this strategy.",
+                     minLot, minLotRisk * 100.0, InpMaxRiskPct * 100.0,
+                     minLot * lossPerLot / InpMaxRiskPct, AccountInfoString(ACCOUNT_CURRENCY));
+         return 0.0;
+      }}
+      Print("ALGLORY: account too small for the chosen risk (enable InpMinLotFallback to trade the minimum lot).");
       return 0.0;
    }}
    return MathMin(lots, maxLot);
