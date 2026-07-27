@@ -50,10 +50,21 @@ class ExecutorManager:
             self._thread = threading.Thread(target=self._loop, name="alglory-executor", daemon=True)
             self._thread.start()
 
-    def arm_strategies(self, runtimes, mode: str, confirm_live: bool, *, poll_seconds: float = 5.0) -> None:
+    def arm_strategies(
+        self,
+        runtimes,
+        mode: str,
+        confirm_live: bool,
+        *,
+        poll_seconds: float = 5.0,
+        max_open_positions: int | None = None,
+    ) -> None:
         """Build the MT5-backed executor for the given runtimes and start it."""
         source = self._build_source()
-        executor = LiveExecutor(source, runtimes, mode=Mode(mode), confirm_live=confirm_live)
+        executor = LiveExecutor(
+            source, runtimes, mode=Mode(mode), confirm_live=confirm_live,
+            max_open_positions=max_open_positions,
+        )
         self.arm(executor, MT5BarClock(source), poll_seconds=poll_seconds)
 
     def _build_source(self):

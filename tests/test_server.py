@@ -317,8 +317,11 @@ class FakeExecutorManager:
         self.armed = None
         self.stopped = False
 
-    def arm_strategies(self, runtimes, mode, confirm_live, *, poll_seconds=5.0):
-        self.armed = {"runtimes": runtimes, "mode": mode, "confirm_live": confirm_live}
+    def arm_strategies(self, runtimes, mode, confirm_live, *, poll_seconds=5.0, max_open_positions=None):
+        self.armed = {
+            "runtimes": runtimes, "mode": mode, "confirm_live": confirm_live,
+            "max_open_positions": max_open_positions,
+        }
 
     def stop(self):
         self.stopped = True
@@ -369,11 +372,13 @@ def test_executor_arm_dry_run_builds_runtimes(app_client):
     sid = _seed_strategy(cfg)
     r = client.post(
         "/api/executor/arm",
-        json={"strategy_ids": [sid], "mode": "dry_run", "preset": "prop_conservative"},
+        json={"strategy_ids": [sid], "mode": "dry_run", "preset": "prop_conservative",
+              "max_open_positions": 3},
     )
     assert r.status_code == 200
     assert fake.armed is not None
     assert fake.armed["mode"] == "dry_run"
+    assert fake.armed["max_open_positions"] == 3
     assert len(fake.armed["runtimes"]) == 1
     assert fake.armed["runtimes"][0].magic == 990_000 + sid
 

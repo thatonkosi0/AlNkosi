@@ -48,6 +48,7 @@ class ExecutorArmRequest(BaseModel):
     preset: str = "personal"
     confirm_live: bool = False
     poll_seconds: float = 5.0
+    max_open_positions: int | None = None
 
 
 def _resolve_deploy_dir(cfg: AppConfig) -> tuple[Path, str, str | None]:
@@ -289,7 +290,9 @@ def create_app(cfg: AppConfig) -> FastAPI:
             )
         try:
             app.state.executor.arm_strategies(
-                runtimes, mode, req.confirm_live, poll_seconds=req.poll_seconds
+                runtimes, mode, req.confirm_live,
+                poll_seconds=req.poll_seconds,
+                max_open_positions=req.max_open_positions,
             )
         except BusyError as exc:
             raise HTTPException(409, str(exc)) from exc

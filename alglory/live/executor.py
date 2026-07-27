@@ -45,6 +45,7 @@ class Action(str, Enum):
     HOLD = "hold"
     HALT = "halt"
     SKIP_TOO_SMALL = "skip_too_small"
+    SKIP_CAP = "skip_cap"
 
 
 class ExecutorError(Exception):
@@ -79,14 +80,28 @@ class Intent:
 
 
 class LiveExecutor:
-    def __init__(self, source, runtimes, *, mode: Mode = Mode.DRY_RUN, confirm_live: bool = False):
+    def __init__(
+        self,
+        source,
+        runtimes,
+        *,
+        mode: Mode = Mode.DRY_RUN,
+        confirm_live: bool = False,
+        max_open_positions: int | None = None,
+    ):
         if mode == Mode.LIVE and not confirm_live:
             raise ExecutorError("live mode requires confirm_live=True — refusing to arm.")
+        if max_open_positions is not None and max_open_positions < 1:
+            raise ExecutorError("max_open_positions must be >= 1.")
         self.source = source
         self.runtimes = list(runtimes)
         self.mode = mode
         self._confirm_live = confirm_live
+        self.max_open_positions = max_open_positions
         self.events: list[Intent] = []
+
+    def _total_open(self) -> int:
+        return sum(len(self.source.positions(rt.magic)) for rt in self.runtimes)
 
     # ---- decision (pure w.r.t. the broker; reads state, no side effects) ----
 
@@ -142,6 +157,10 @@ class LiveExecutor:
         if lots <= 0:
             return Intent(Action.SKIP_TOO_SMALL, rt.magic, rt.symbol,
                           reason="risk-based size below broker min lot")
+
+        if self.max_open_positions is not None and self._total_open() >= self.max_open_positions:
+            return Intent(Action.SKIP_CAP, rt.magic, rt.symbol,
+                          reason=f"global cap of {self.max_open_positions} open positions reached")
 
         entry_px = float(close[-1])
         sl = entry_px - d * sl_dist

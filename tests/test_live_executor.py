@@ -143,6 +143,46 @@ def test_replay_on_demo_places_and_broker_exits_run():
     assert any(o[0] == "broker_exit" for o in src.orders)
 
 
+def _rt_magic(m):
+    return StrategyRuntime(
+        genome=_trading_genome(), symbol="EURUSD", timeframe="H1",
+        guard=GUARDRAIL_PRESETS["personal"], magic=m,
+    )
+
+
+def _multi_replay(executor, runtimes, bars, warmup=150):
+    close = bars["close"].to_numpy()
+    max_open = 0
+    for i in range(warmup, len(bars)):
+        executor.source.mark_price(float(close[i]))
+        for rt in runtimes:
+            executor.on_bar(rt, bars.iloc[: i + 1])
+        total = sum(len(executor.source.positions(rt.magic)) for rt in runtimes)
+        max_open = max(max_open, total)
+    return max_open
+
+
+def test_max_open_positions_cap_is_enforced():
+    bars = generate_bars("EURUSD", "H1", 1500, seed=7)
+    rts = [_rt_magic(1), _rt_magic(2)]
+    ex = LiveExecutor(FakeMT5Source(balance=100_000), rts, mode=Mode.DEMO, max_open_positions=1)
+    max_open = _multi_replay(ex, rts, bars)
+    assert max_open <= 1  # never more than the cap open at once
+    assert any(e.action == Action.SKIP_CAP for e in ex.events)
+
+
+def test_without_cap_both_strategies_can_hold_positions():
+    bars = generate_bars("EURUSD", "H1", 1500, seed=7)
+    rts = [_rt_magic(1), _rt_magic(2)]
+    ex = LiveExecutor(FakeMT5Source(balance=100_000), rts, mode=Mode.DEMO)
+    assert _multi_replay(ex, rts, bars) == 2
+
+
+def test_bad_cap_rejected():
+    with pytest.raises(ExecutorError):
+        LiveExecutor(FakeMT5Source(), [], mode=Mode.DRY_RUN, max_open_positions=0)
+
+
 def test_stop_flattens_and_halts():
     src = FakeMT5Source()
     rt = _rt(_trading_genome())
