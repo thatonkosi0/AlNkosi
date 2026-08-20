@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from alglory.backtest.engine import build_signals
 from alglory.data.fake_mt5 import FakeMT5Source
+from alglory.data.mt5source import PositionInfo
 from alglory.data.sample import generate_bars
 from alglory.deploy.mql5 import GUARDRAIL_PRESETS
 from alglory.genome import (
@@ -193,3 +195,101 @@ def test_stop_flattens_and_halts():
     assert src.positions(MAGIC) == []
     assert rt.halted is True
     assert ex.status()[0]["halted"] is True
+
+
+# ---- stop management (breakeven, trailing, time exit) ------------------
+
+
+def test_manage_stops_arms_breakeven():
+    g = Genome(
+        "trend", "long",
+        SignalGene("ma_cross", {"fast": 5, "slow": 15}),
+        FilterGene(trend_ma=None, session=None, atr_regime=None),
+        ManagementGene(sl_atr=1.5, tp_atr=6.0, trail_atr=None, max_bars=None, breakeven_atr=0.5),
+        RiskGene(0.01),
+    )
+    rt = StrategyRuntime(
+        genome=g, symbol="EURUSD", timeframe="H1",
+        guard=GUARDRAIL_PRESETS["personal"], magic=MAGIC,
+    )
+    rt.entry_atr = 0.0010
+    ex = LiveExecutor(FakeMT5Source(), [], mode=Mode.DRY_RUN)
+    current = PositionInfo(
+        ticket=1, symbol="EURUSD", direction=1, volume=0.1,
+        price_open=1.1000, sl=1.0985, tp=1.1060, magic=MAGIC, profit=0.0,
+    )
+    # breakeven trigger = 1.1000 + 0.5 * 0.0010 = 1.1005 -> bar's high reaches it
+    high = np.array([1.1000, 1.1006])
+    low = np.array([1.0995, 1.1000])
+    sl, tp, reason = ex._manage_stops(rt, current, high, low, bar_atr=0.0012)
+    assert reason == "be"
+    assert sl == pytest.approx(1.1000)
+    assert rt.be_armed is True
+
+
+def test_manage_stops_ratchets_trail():
+    g = Genome(
+        "trend", "long",
+        SignalGene("ma_cross", {"fast": 5, "slow": 15}),
+        FilterGene(trend_ma=None, session=None, atr_regime=None),
+        ManagementGene(sl_atr=1.5, tp_atr=6.0, trail_atr=1.0, max_bars=None, breakeven_atr=None),
+        RiskGene(0.01),
+    )
+    rt = StrategyRuntime(
+        genome=g, symbol="EURUSD", timeframe="H1",
+        guard=GUARDRAIL_PRESETS["personal"], magic=MAGIC,
+    )
+    rt.entry_atr = 0.0010
+    ex = LiveExecutor(FakeMT5Source(), [], mode=Mode.DRY_RUN)
+    current = PositionInfo(
+        ticket=1, symbol="EURUSD", direction=1, volume=0.1,
+        price_open=1.1000, sl=1.0985, tp=1.1060, magic=MAGIC, profit=0.0,
+    )
+    high = np.array([1.1030])
+    low = np.array([1.1010])
+    # candidate = high[-1] - trail_atr * bar_atr = 1.1030 - 0.0010 = 1.1020 > sl(1.0985)
+    sl, tp, reason = ex._manage_stops(rt, current, high, low, bar_atr=0.0010)
+    assert reason == "trail"
+    assert sl == pytest.approx(1.1020)
+    assert tp == pytest.approx(1.1060 + (1.1020 - 1.0985))
+
+
+def test_time_exit_closes_after_max_bars():
+    g = Genome(
+        "trend", "both",
+        SignalGene("ma_cross", {"fast": 5, "slow": 15}),
+        FilterGene(trend_ma=None, session=None, atr_regime=None),
+        ManagementGene(sl_atr=1.5, tp_atr=6.0, trail_atr=None, max_bars=3, breakeven_atr=None),
+        RiskGene(0.01),
+    )
+    bars = generate_bars("EURUSD", "H1", 1500, seed=7)
+    src = FakeMT5Source(balance=100_000)
+    ex = LiveExecutor(src, [], mode=Mode.DEMO)
+    rt = StrategyRuntime(
+        genome=g, symbol="EURUSD", timeframe="H1",
+        guard=GUARDRAIL_PRESETS["personal"], magic=MAGIC,
+    )
+    replay(ex, rt, bars)
+    time_exits = [e for e in ex.events if e.action == Action.CLOSE and e.reason == "time exit"]
+    assert len(time_exits) > 0
+
+
+def test_live_executor_ratchets_and_arms_over_a_full_replay():
+    g = Genome(
+        "trend", "both",
+        SignalGene("ma_cross", {"fast": 5, "slow": 15}),
+        FilterGene(trend_ma=None, session=None, atr_regime=None),
+        ManagementGene(sl_atr=1.5, tp_atr=6.0, trail_atr=1.0, max_bars=40, breakeven_atr=0.5),
+        RiskGene(0.01),
+    )
+    bars = generate_bars("EURUSD", "H1", 1500, seed=7)
+    src = FakeMT5Source(balance=100_000)
+    ex = LiveExecutor(src, [], mode=Mode.DEMO)
+    rt = StrategyRuntime(
+        genome=g, symbol="EURUSD", timeframe="H1",
+        guard=GUARDRAIL_PRESETS["personal"], magic=MAGIC,
+    )
+    replay(ex, rt, bars)
+    modifies = [e for e in ex.events if e.action == Action.MODIFY]
+    assert len(modifies) > 0
+    assert any(e.reason == "trail" for e in modifies)
