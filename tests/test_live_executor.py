@@ -116,6 +116,26 @@ def test_guardrail_halt_when_drawdown_breached():
 # ---- sizing gate -----------------------------------------------------
 
 
+def test_sizing_respects_guardrail_preset_cap():
+    bars = generate_bars("EURUSD", "H1", 1500, seed=7)
+    g = _trading_genome()  # RiskGene(0.01)
+
+    def first_open_lots(guard):
+        rt = StrategyRuntime(genome=g, symbol="EURUSD", timeframe="H1", guard=guard, magic=MAGIC)
+        ex = LiveExecutor(FakeMT5Source(balance=100_000), [], mode=Mode.DEMO)
+        for i in range(120, len(bars)):
+            intent = ex.decide(rt, bars.iloc[: i + 1])
+            if intent.action in (Action.OPEN_LONG, Action.OPEN_SHORT):
+                return intent.lots
+        return None
+
+    lots_personal = first_open_lots(GUARDRAIL_PRESETS["personal"])  # risk_pct 0.01, matches genome
+    lots_conservative = first_open_lots(GUARDRAIL_PRESETS["prop_conservative"])  # risk_pct 0.005
+
+    assert lots_personal is not None and lots_conservative is not None
+    assert lots_conservative < lots_personal
+
+
 def test_big_account_opens_but_tiny_account_skips():
     bars = generate_bars("EURUSD", "H1", 1500, seed=7)
     g = _trading_genome()

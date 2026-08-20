@@ -169,7 +169,11 @@ class LiveExecutor:
         sl_dist = rt.genome.management.sl_atr * entry_atr
         tp_dist = rt.genome.management.tp_atr * entry_atr
         spec = self.source.symbol_spec(rt.symbol)
-        lots = lots_for_risk(acct.balance, rt.genome.risk.risk_pct, sl_dist, spec)
+        # The guardrail preset is a ceiling on per-trade risk, not just the
+        # daily-loss/max-DD halts — mirrors the generated EA, which always
+        # sizes off InpRiskPct (the preset), never the genome's own risk_pct.
+        risk_pct = min(rt.genome.risk.risk_pct, rt.guard.risk_pct)
+        lots = lots_for_risk(acct.balance, risk_pct, sl_dist, spec)
         if lots <= 0:
             return Intent(Action.SKIP_TOO_SMALL, rt.magic, rt.symbol,
                           reason="risk-based size below broker min lot")
