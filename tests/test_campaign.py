@@ -232,11 +232,16 @@ def test_campaign_rejects_invalid_symbol_characters():
 
 
 def test_robustness_scoring_failure_is_logged(monkeypatch, vault, cache):
+    import importlib
+
     def _boom(*a, **kw):
         raise RuntimeError("scorer exploded")
 
     # Get the actual module by importing with __import__ to avoid name collision
     robustness_module = __import__("alglory.analysis.robustness", fromlist=["robustness"])
+
+    # Reload the module to clear any cached state from previous tests
+    importlib.reload(robustness_module)
 
     monkeypatch.setattr(robustness_module, "robustness", _boom)
 
