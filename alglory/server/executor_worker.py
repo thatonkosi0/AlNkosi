@@ -113,6 +113,9 @@ class ExecutorManager:
             self._last_bar[rt.magic] = stamp
             intent = self._executor.on_bar(rt, bars)
             self._queue.put(self._event(rt, intent))
+        for err in self._executor.execution_errors:
+            self._queue.put({"type": "executor_error", **err})
+        self._executor.execution_errors.clear()
 
     # ---- introspection ----------------------------------------------------
 

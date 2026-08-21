@@ -7,7 +7,7 @@ import pytest
 
 from alglory.backtest.engine import build_signals
 from alglory.data.fake_mt5 import FakeMT5Source
-from alglory.data.mt5source import PositionInfo
+from alglory.data.mt5source import OrderResult, PositionInfo
 from alglory.data.sample import generate_bars
 from alglory.deploy.mql5 import GUARDRAIL_PRESETS
 from alglory.genome import (
@@ -313,3 +313,34 @@ def test_live_executor_ratchets_and_arms_over_a_full_replay():
     modifies = [e for e in ex.events if e.action == Action.MODIFY]
     assert len(modifies) > 0
     assert any(e.reason == "trail" for e in modifies)
+
+
+# ---- execution failures (errors surface instead of being discarded) --------
+
+
+def test_execution_failure_recorded_on_rejected_open():
+    class _RejectingSource(FakeMT5Source):
+        def place_market(self, *a, **kw):
+            return OrderResult(False, -1, "rejected: market closed")
+
+    src = _RejectingSource(balance=100_000)
+    ex = LiveExecutor(src, [], mode=Mode.DEMO)
+    rt = _rt(_trading_genome())
+    replay(ex, rt, generate_bars("EURUSD", "H1", 1500, seed=7))
+    assert len(ex.execution_errors) > 0
+    assert ex.execution_errors[0]["action"] in ("open_long", "open_short")
+    assert "rejected" in ex.execution_errors[0]["message"]
+
+
+def test_execution_failure_recorded_on_rejected_close():
+    class _NoCloseSource(FakeMT5Source):
+        def close_position(self, symbol, magic):
+            return False
+
+    src = _NoCloseSource(balance=100_000)
+    rt = _rt(_trading_genome())
+    ex = LiveExecutor(src, [rt], mode=Mode.DEMO)
+    src.place_market("EURUSD", 1, 0.1, sl=1.05, tp=1.15, magic=MAGIC)
+    rt.peak_equity = 2_000_000.0  # forces a guardrail halt -> CLOSE intent
+    ex.on_bar(rt, generate_bars("EURUSD", "H1", 200, seed=1))
+    assert any(e["action"] == "close" for e in ex.execution_errors)

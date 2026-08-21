@@ -103,6 +103,7 @@ class LiveExecutor:
         self._confirm_live = confirm_live
         self.max_open_positions = max_open_positions
         self.events: list[Intent] = []
+        self.execution_errors: list[dict] = []
 
     def _total_open(self) -> int:
         return sum(len(self.source.positions(rt.magic)) for rt in self.runtimes)
@@ -236,13 +237,24 @@ class LiveExecutor:
     def _execute(self, rt: StrategyRuntime, intent: Intent) -> None:
         if intent.action in (Action.OPEN_LONG, Action.OPEN_SHORT):
             direction = 1 if intent.action == Action.OPEN_LONG else -1
-            self.source.place_market(
+            result = self.source.place_market(
                 rt.symbol, direction, intent.lots, sl=intent.sl, tp=intent.tp, magic=rt.magic
             )
+            if not result.ok:
+                self._record_error(rt, intent, result.message)
         elif intent.action == Action.CLOSE:
-            self.source.close_position(rt.symbol, rt.magic)
+            ok = self.source.close_position(rt.symbol, rt.magic)
+            if not ok:
+                self._record_error(rt, intent, "close_position rejected or position not found")
         elif intent.action == Action.MODIFY:
-            self.source.modify_position(rt.symbol, rt.magic, sl=intent.sl, tp=intent.tp)
+            ok = self.source.modify_position(rt.symbol, rt.magic, sl=intent.sl, tp=intent.tp)
+            if not ok:
+                self._record_error(rt, intent, "modify_position rejected or position not found")
+
+    def _record_error(self, rt: StrategyRuntime, intent: Intent, message: str) -> None:
+        self.execution_errors.append(
+            {"magic": rt.magic, "symbol": rt.symbol, "action": intent.action.value, "message": message}
+        )
 
     def stop(self) -> None:
         """Kill switch: flatten every managed strategy and halt it."""
