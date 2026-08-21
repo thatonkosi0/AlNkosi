@@ -139,3 +139,37 @@ def test_bar_clock_returns_none_on_fetch_error():
             raise RuntimeError("no terminal")
 
     assert MT5BarClock(_BadSource()).latest_closed_bars("EURUSD", "H1") is None
+
+
+def test_manager_drains_execution_errors_as_events():
+    """Verify that execution_errors are drained as executor_error events in the queue."""
+    frame = generate_bars("EURUSD", "H1", 260, seed=7).iloc[:250].reset_index(drop=True)
+    ex = LiveExecutor(FakeMT5Source(balance=100_000), [_rt()], mode=Mode.DEMO)
+    m = ExecutorManager()
+    m.arm(ex, _FixedClock(frame), start=False)
+
+    # Inject a synthetic execution error into the executor's error list
+    ex.execution_errors.append({
+        "magic": MAGIC,
+        "symbol": "EURUSD",
+        "action": "open_long",
+        "message": "rejected: market closed"
+    })
+
+    # Tick to process and drain errors
+    m.tick()
+    events = m.drain()
+
+    # Find the executor_error event
+    error_events = [e for e in events if e.get("type") == "executor_error"]
+    assert len(error_events) == 1
+
+    # Verify the error event has the correct structure
+    err = error_events[0]
+    assert err["magic"] == MAGIC
+    assert err["symbol"] == "EURUSD"
+    assert err["action"] == "open_long"
+    assert err["message"] == "rejected: market closed"
+
+    # Verify the error list was cleared after draining
+    assert len(ex.execution_errors) == 0
