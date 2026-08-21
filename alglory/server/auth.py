@@ -31,20 +31,37 @@ class TokenAuthMiddleware:
         self.app = app
         self.token = token
 
+    @staticmethod
+    def _supplied(scope) -> bytes:
+        """The raw token bytes the caller sent, or b"" — never raises.
+
+        Everything read here is attacker-controlled and can be *any* byte
+        string, so this stays in bytes end to end. Decoding as UTF-8 would
+        raise UnicodeDecodeError on invalid bytes (e.g. ?token=%FF), and
+        secrets.compare_digest raises TypeError on a non-ASCII str (e.g.
+        ?token=%C3%A9). This is raw ASGI middleware sitting above FastAPI's
+        exception handling, so either would escape as an unhandled 500 from
+        the one module whose job is gatekeeping live trading. latin-1 is a
+        byte-exact round trip for every possible input, so no token — however
+        malformed — can do anything but fail closed with a 401.
+        """
+        if scope["type"] == "http":
+            headers = dict(scope.get("headers") or [])
+            supplied = headers.get(b"x-alglory-token", b"")
+            if supplied:
+                return supplied
+        query = (scope.get("query_string") or b"").decode("latin-1")
+        for key, value in parse_qsl(query, encoding="latin-1"):
+            if key == "token":
+                return value.encode("latin-1")
+        return b""
+
     async def __call__(self, scope, receive, send):
         if scope["type"] not in ("http", "websocket") or not _is_protected(scope["path"]):
             await self.app(scope, receive, send)
             return
 
-        supplied = ""
-        if scope["type"] == "http":
-            headers = dict(scope.get("headers") or [])
-            supplied = headers.get(b"x-alglory-token", b"").decode()
-        if not supplied:
-            query = dict(parse_qsl((scope.get("query_string") or b"").decode()))
-            supplied = query.get("token", "")
-
-        if not secrets.compare_digest(supplied, self.token):
+        if not secrets.compare_digest(self._supplied(scope), self.token.encode("utf-8")):
             if scope["type"] == "websocket":
                 await send({"type": "websocket.close", "code": 4401})
             else:

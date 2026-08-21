@@ -121,6 +121,9 @@ class ExecutorManager:
         for err in self._executor.execution_errors:
             self._queue.put({"type": "executor_error", **err})
         self._executor.execution_errors.clear()
+        for warn in self._executor.execution_warnings:
+            self._queue.put({"type": "executor_warning", **warn})
+        self._executor.execution_warnings.clear()
 
     # ---- introspection ----------------------------------------------------
 

@@ -104,6 +104,9 @@ class LiveExecutor:
         self.max_open_positions = max_open_positions
         self.events: list[Intent] = []
         self.execution_errors: list[dict] = []
+        # Non-fatal anomalies the operator should see but which are not order
+        # failures (drained by ExecutorManager.tick as executor_warning events).
+        self.execution_warnings: list[dict] = []
 
     def _total_open(self) -> int:
         return sum(len(self.source.positions(rt.magic)) for rt in self.runtimes)
@@ -149,6 +152,8 @@ class LiveExecutor:
 
         if pos:
             current = pos[0]
+            if rt.entry_atr <= 0:
+                self._adopt_position(rt, current, bar_atr)
             rt.bars_in_trade += 1
             mgmt = rt.genome.management
             if mgmt.max_bars is not None and rt.bars_in_trade >= mgmt.max_bars:
@@ -191,6 +196,44 @@ class LiveExecutor:
         rt.be_armed = False
         rt.bars_in_trade = 0
         return Intent(action, rt.magic, rt.symbol, lots=lots, sl=sl, tp=tp, direction=d, reason="signal")
+
+    def _adopt_position(self, rt: StrategyRuntime, current, bar_atr: float) -> None:
+        """Take over a position that was already open before this runtime existed.
+
+        ``POST /api/executor/arm`` rebuilds every ``StrategyRuntime`` from
+        scratch (``entry_atr=0.0, be_armed=False, bars_in_trade=0``) and the
+        magic number is deterministic (``990_000 + strategy_id``) — so if the
+        server dies while a position is open and is then restarted and
+        re-armed, it "adopts" that live position with state that does not
+        describe it. ``entry_atr == 0.0`` is the tell, and it is actively
+        dangerous: ``_manage_stops`` would compute
+        ``price_open + d * breakeven_atr * 0.0``, i.e. a breakeven trigger
+        exactly at ``price_open``, which the very next bar essentially always
+        "reaches" — yanking the stop to breakeven no matter what the genome's
+        ``breakeven_atr`` actually says.
+
+        So: seed a real ATR from the current bar to clear the sentinel, and
+        treat breakeven as already decided rather than arming it off state we
+        never observed. Declining to arm is the conservative direction — it
+        leaves the broker-side stop exactly where the operator's broker
+        already has it instead of moving real money's risk on a guess.
+        """
+        seeded = float(bar_atr) if not np.isnan(bar_atr) and bar_atr > 0 else 0.0
+        rt.entry_atr = seeded
+        rt.be_armed = True  # skip breakeven arming: no real basis to arm it from
+        side = "long" if current.direction == 1 else "short"
+        atr_note = (
+            f"seeded entry_atr={seeded:.6g} from the current bar"
+            if seeded > 0
+            else "no usable ATR on this bar yet, so entry_atr stays unset"
+        )
+        self._record_warning(
+            rt,
+            f"adopted an already-open {side} position (ticket {current.ticket}) with no "
+            f"entry state — this happens after a crash/restart + re-arm. Breakeven "
+            f"arming is declined for this position and the max_bars clock restarts "
+            f"from this bar; {atr_note}.",
+        )
 
     def _manage_stops(self, rt: StrategyRuntime, current, high, low, bar_atr: float):
         """Mirror engine.update_stops: arm breakeven, ratchet the trail.
@@ -254,6 +297,13 @@ class LiveExecutor:
     def _record_error(self, rt: StrategyRuntime, intent: Intent, message: str) -> None:
         self.execution_errors.append(
             {"magic": rt.magic, "symbol": rt.symbol, "action": intent.action.value, "message": message}
+        )
+
+    def _record_warning(self, rt: StrategyRuntime, message: str) -> None:
+        """A non-fatal anomaly worth an operator's attention but not an order
+        failure — same shape as the worker's bar-fetch executor_warning."""
+        self.execution_warnings.append(
+            {"magic": rt.magic, "symbol": rt.symbol, "message": message}
         )
 
     def stop(self) -> None:

@@ -234,6 +234,17 @@ def test_campaign_rejects_invalid_symbol_characters():
 
 
 def test_robustness_scoring_failure_is_logged(monkeypatch, vault, cache):
+    """A robustness scorer that raises must be logged, not abort the campaign.
+
+    Reaching that try/except needs at least one strategy to vault. Whether a
+    real GA run vaults anything is non-deterministic (OOS gating on evolved
+    genomes), so this used to be forced with a 40-population/15-generation
+    two-tribe campaign — ~40s, and still only *probably* vaulting. Instead,
+    inject exactly one vaulted genome into the first generation's result: the
+    vaulting path then runs deterministically and the GA stays tiny.
+    """
+    import alglory.evolve.campaign as campaign_mod
+
     def _boom(*a, **kw):
         raise RuntimeError("scorer exploded")
 
@@ -242,15 +253,29 @@ def test_robustness_scoring_failure_is_logged(monkeypatch, vault, cache):
 
     monkeypatch.setattr(robustness_module, "robustness", _boom)
 
+    real_evolve_tribe = campaign_mod.evolve_tribe
+    injected = []
+
+    def _evolve_tribe_with_one_vault(*args, **kwargs):
+        for result in real_evolve_tribe(*args, **kwargs):
+            if not injected:
+                injected.append(result.top.genome)
+                # (genome, is_metrics, oos_metrics) — the campaign only reads
+                # .to_dict()/.net_profit off these, so the top candidate's own
+                # in-sample metrics stand in for both.
+                result.vaulted = [
+                    (result.top.genome, result.top.is_metrics, result.top.is_metrics)
+                ]
+            yield result
+
+    monkeypatch.setattr(campaign_mod, "evolve_tribe", _evolve_tribe_with_one_vault)
+
     events = []
-    # Use generous GA parameters to make vaulting nearly certain. This ensures the
-    # robustness-scoring try/except block runs, making the test robust to RNG
-    # variations and other sources of non-determinism in genome selection/gating.
     cfg = CampaignConfig(
         symbols=["EURUSD"],
-        tribes=["trend", "momentum"],
-        population=40,
-        generations=15,
+        tribes=["trend"],
+        population=6,
+        generations=2,
         seed=42,
         timeframe="H1",
         source="sample",
@@ -258,8 +283,17 @@ def test_robustness_scoring_failure_is_logged(monkeypatch, vault, cache):
     )
     run_campaign(cfg, vault, cache, events.append, should_stop=lambda: False)
 
+    # the premise: the vaulting path ran. The injection guarantees it; the real
+    # GA may or may not additionally vault one of its own (that non-determinism
+    # is exactly what this test no longer depends on), so assert >= 1.
+    assert len(injected) == 1
+    assert len([e for e in events if e["type"] == "strategy_vaulted"]) >= 1
+
     logs = [e["line"] for e in events if e["type"] == "log"]
     assert any("robustness scoring failed" in line for line in logs)
+    # and the failure did not abort the campaign
+    finished = next(e for e in events if e["type"] == "campaign_finished")
+    assert finished["status"] == "done"
 
 
 def test_optimize_fails_loudly_when_seed_tribe_not_selected(vault, cache):

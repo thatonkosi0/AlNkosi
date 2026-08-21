@@ -463,3 +463,46 @@ def test_websocket_requires_token(app_client):
     with pytest.raises(WebSocketDisconnect):
         with bare.websocket_connect("/ws/events"):
             pass
+
+
+# A malformed token must fail closed with a clean 401 — never an unhandled
+# 500. secrets.compare_digest raises TypeError on non-ASCII str, and decoding
+# raw invalid-UTF-8 header bytes raises UnicodeDecodeError; both are reachable
+# from a browser address bar in the one module that gatekeeps live trading.
+@pytest.mark.parametrize(
+    "query_token",
+    [
+        "%C3%A9",        # valid UTF-8, non-ASCII -> compare_digest TypeError
+        "%FF",           # invalid UTF-8 byte    -> UnicodeDecodeError
+        "%FF%FE%00",     # invalid UTF-8 + NUL
+        "caf%C3%A9",     # non-ASCII mixed with ASCII
+        "%E2%82%AC" * 8,  # longer non-ASCII payload
+    ],
+)
+def test_malformed_query_token_is_a_clean_401(app_client, query_token):
+    client, fake, cfg = app_client
+    bare = TestClient(client.app)
+    r = bare.get(f"/api/status?token={query_token}")
+    assert r.status_code == 401
+
+
+@pytest.mark.parametrize("header_bytes", [b"\xc3\xa9", b"\xff", b"\xff\xfe"])
+def test_malformed_header_token_is_a_clean_401(app_client, header_bytes):
+    client, fake, cfg = app_client
+    bare = TestClient(client.app)
+    r = bare.get("/api/status", headers={b"X-Alglory-Token": header_bytes})
+    assert r.status_code == 401
+
+
+def test_malformed_token_does_not_break_the_websocket_gate(app_client):
+    client, fake, cfg = app_client
+    bare = TestClient(client.app)
+    with pytest.raises(WebSocketDisconnect):
+        with bare.websocket_connect("/ws/events?token=%FF"):
+            pass
+
+
+def test_correct_token_still_accepted_after_hardening(app_client):
+    client, fake, cfg = app_client
+    bare = TestClient(client.app)
+    assert bare.get("/api/status?token=test-token").status_code == 200

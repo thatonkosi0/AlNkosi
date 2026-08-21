@@ -198,3 +198,25 @@ def test_manager_drains_execution_errors_as_events():
 
     # Verify the error list was cleared after draining
     assert len(ex.execution_errors) == 0
+
+
+def test_manager_drains_execution_warnings_as_events():
+    """A non-fatal executor anomaly (e.g. adopting a position after a restart)
+    must reach the operator as an executor_warning, not die in the executor."""
+    frame = generate_bars("EURUSD", "H1", 260, seed=7).iloc[:250].reset_index(drop=True)
+    ex = LiveExecutor(FakeMT5Source(balance=100_000), [_rt()], mode=Mode.DEMO)
+    m = ExecutorManager()
+    m.arm(ex, _FixedClock(frame), start=False)
+
+    ex.execution_warnings.append(
+        {"magic": MAGIC, "symbol": "EURUSD", "message": "adopted an already-open long position"}
+    )
+    m.tick()
+    events = m.drain()
+
+    warnings = [e for e in events if e.get("type") == "executor_warning"]
+    assert len(warnings) == 1
+    assert warnings[0]["magic"] == MAGIC
+    assert warnings[0]["symbol"] == "EURUSD"
+    assert "adopted" in warnings[0]["message"]
+    assert len(ex.execution_warnings) == 0  # drained, not re-emitted forever
