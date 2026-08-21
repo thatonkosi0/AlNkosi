@@ -232,8 +232,6 @@ def test_campaign_rejects_invalid_symbol_characters():
 
 
 def test_robustness_scoring_failure_is_logged(monkeypatch, vault, cache):
-    import numpy as np
-
     def _boom(*a, **kw):
         raise RuntimeError("scorer exploded")
 
@@ -242,12 +240,20 @@ def test_robustness_scoring_failure_is_logged(monkeypatch, vault, cache):
 
     monkeypatch.setattr(robustness_module, "robustness", _boom)
 
-    # Reset both legacy and new numpy RNG to ensure deterministic behavior
-    np.random.seed(42)
-
     events = []
-    # Use TINY config with increased generations to guarantee vaulting despite RNG state
-    cfg = CampaignConfig(**{**TINY, "tribes": ["trend"], "generations": 10})
+    # Use generous GA parameters to make vaulting nearly certain. This ensures the
+    # robustness-scoring try/except block runs, making the test robust to RNG
+    # variations and other sources of non-determinism in genome selection/gating.
+    cfg = CampaignConfig(
+        symbols=["EURUSD"],
+        tribes=["trend", "momentum"],
+        population=40,
+        generations=15,
+        seed=42,
+        timeframe="H1",
+        source="sample",
+        min_trades=5,
+    )
     run_campaign(cfg, vault, cache, events.append, should_stop=lambda: False)
 
     logs = [e["line"] for e in events if e["type"] == "log"]
