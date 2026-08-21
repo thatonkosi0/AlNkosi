@@ -21,13 +21,16 @@ class MT5BarClock:
     def __init__(self, source, count: int = 300) -> None:
         self._source = source
         self._count = count
+        self.last_error: str | None = None
 
     def latest_closed_bars(self, symbol: str, timeframe: str) -> pd.DataFrame | None:
         try:
             df = self._source.fetch_bars(symbol, timeframe, self._count + 1)
-        except Exception:
+        except Exception as exc:
+            self.last_error = str(exc)
             return None
         if df is None or len(df) < 2:
+            self.last_error = "fetch_bars returned insufficient history"
             return None
-        # drop the still-forming last bar; the new last row is the last closed bar
+        self.last_error = None
         return df.iloc[:-1].reset_index(drop=True)

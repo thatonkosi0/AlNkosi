@@ -141,6 +141,31 @@ def test_bar_clock_returns_none_on_fetch_error():
     assert MT5BarClock(_BadSource()).latest_closed_bars("EURUSD", "H1") is None
 
 
+def test_clock_captures_last_error_on_fetch_failure():
+    class _BadSource:
+        def fetch_bars(self, *a):
+            raise RuntimeError("no terminal")
+
+    clock = MT5BarClock(_BadSource())
+    assert clock.latest_closed_bars("EURUSD", "H1") is None
+    assert "no terminal" in clock.last_error
+
+
+def test_tick_emits_warning_on_fetch_failure():
+    class _FailClock:
+        last_error = "no terminal"
+
+        def latest_closed_bars(self, symbol, timeframe):
+            return None
+
+    ex = LiveExecutor(FakeMT5Source(balance=100_000), [_rt()], mode=Mode.DEMO)
+    m = ExecutorManager()
+    m.arm(ex, _FailClock(), start=False)
+    m.tick()
+    events = m.drain()
+    assert any(e["type"] == "executor_warning" and "no terminal" in e["message"] for e in events)
+
+
 def test_manager_drains_execution_errors_as_events():
     """Verify that execution_errors are drained as executor_error events in the queue."""
     frame = generate_bars("EURUSD", "H1", 260, seed=7).iloc[:250].reset_index(drop=True)

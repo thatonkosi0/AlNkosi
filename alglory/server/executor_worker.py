@@ -106,6 +106,11 @@ class ExecutorManager:
         for rt in self._runtimes:
             bars = self._clock.latest_closed_bars(rt.symbol, rt.timeframe)
             if bars is None or len(bars) == 0:
+                message = getattr(self._clock, "last_error", None) or "no bars returned"
+                self._queue.put({
+                    "type": "executor_warning", "magic": rt.magic, "symbol": rt.symbol,
+                    "message": f"bar fetch failed: {message}",
+                })
                 continue
             stamp = str(bars["time"].iloc[-1])
             if self._last_bar.get(rt.magic) == stamp:
