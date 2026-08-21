@@ -293,8 +293,8 @@ def run_campaign(
                             )
                             vault.set_robustness(sid, r["grade"], r["score"])
                             grade = r["grade"]
-                        except Exception:  # noqa: BLE001 - scoring must not abort a campaign
-                            pass
+                        except Exception as exc:  # noqa: BLE001 - scoring must not abort a campaign
+                            emit({"type": "log", "line": f"robustness scoring failed for strategy {sid}: {exc}"})
                         vaulted_total += 1
                         row = vault.get_strategy(sid)
                         emit(

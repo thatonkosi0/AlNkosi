@@ -229,3 +229,20 @@ def test_campaign_rejects_invalid_symbol_characters():
         CampaignConfig(symbols=["../../etc"], timeframe="H1", tribes=["trend"])
     with pytest.raises(ValidationError):
         CampaignConfig(symbols=['EUR"USD'], timeframe="H1", tribes=["trend"])
+
+
+def test_robustness_scoring_failure_is_logged(monkeypatch, vault, cache):
+    def _boom(*a, **kw):
+        raise RuntimeError("scorer exploded")
+
+    # Get the actual module by importing with __import__ to avoid name collision
+    robustness_module = __import__("alglory.analysis.robustness", fromlist=["robustness"])
+
+    monkeypatch.setattr(robustness_module, "robustness", _boom)
+
+    events = []
+    cfg = CampaignConfig(symbols=["EURUSD"], tribes=["trend"], population=8, generations=2)
+    run_campaign(cfg, vault, cache, events.append, should_stop=lambda: False)
+
+    logs = [e["line"] for e in events if e["type"] == "log"]
+    assert any("robustness scoring failed" in line for line in logs)
