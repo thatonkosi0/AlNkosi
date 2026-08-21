@@ -46,6 +46,33 @@ def test_generate_bars_rejects_unknown_timeframe():
         generate_bars("EURUSD", "M3", 10)
 
 
+def test_generate_bars_reproducible_across_interpreters():
+    """Regression: generate_bars must not depend on PYTHONHASHSEED.
+
+    The symbol used to be mixed into the seed via the built-in hash(), which
+    Python salts randomly per process, so the same seed produced a different
+    price series in a fresh interpreter. Force two different hash seeds and
+    confirm the output is identical."""
+    import os
+    import subprocess
+    import sys
+
+    script = (
+        "from alglory.data.sample import generate_bars; "
+        "df = generate_bars('EURUSD', 'H1', 50, seed=42); "
+        "print(df['close'].to_json())"
+    )
+    env_a = {**os.environ, "PYTHONHASHSEED": "1"}
+    env_b = {**os.environ, "PYTHONHASHSEED": "99"}
+    out_a = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, env=env_a, check=True
+    ).stdout
+    out_b = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, env=env_b, check=True
+    ).stdout
+    assert out_a == out_b
+
+
 def test_cache_round_trip(tmp_path, bars_h1):
     cache = BarCache(tmp_path)
     assert cache.load("EURUSD", "H1") is None

@@ -7,6 +7,8 @@ lose) edges, which keeps GA runs interesting without real market data.
 
 from __future__ import annotations
 
+import zlib
+
 import numpy as np
 import pandas as pd
 
@@ -29,7 +31,10 @@ def generate_bars(symbol: str, timeframe: str, n: int, seed: int = 7) -> pd.Data
             f"Unknown timeframe {timeframe!r}; expected one of {sorted(TIMEFRAME_DELTAS)}"
         )
     # Mix the symbol into the seed so different symbols get different paths.
-    mixed = np.random.SeedSequence([seed, abs(hash(symbol)) % (2**32)])
+    # Uses a stable hash (not the built-in hash(), which PYTHONHASHSEED salts
+    # randomly per process) so the same seed reproduces the same bars across
+    # interpreters, not just within one running process.
+    mixed = np.random.SeedSequence([seed, zlib.crc32(symbol.encode())])
     rng = np.random.default_rng(mixed)
 
     n_regimes = n // _REGIME_LEN + 1
