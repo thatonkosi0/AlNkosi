@@ -75,3 +75,11 @@ def test_check_sufficiency_raises_with_counts():
 def test_check_sufficiency_raises_on_none():
     with pytest.raises(InsufficientDataError):
         check_sufficiency(None, min_bars=10)
+
+
+def test_bar_cache_rejects_invalid_symbol(tmp_path):
+    from alglory.data.cache import BarCache
+
+    cache = BarCache(tmp_path)
+    with pytest.raises(ValueError):
+        cache._path("../../etc/passwd", "H1")

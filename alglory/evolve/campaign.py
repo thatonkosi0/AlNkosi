@@ -16,6 +16,7 @@ import numpy as np
 from pydantic import BaseModel, Field, field_validator
 
 from alglory.backtest.engine import Costs
+from alglory.validation import validate_symbol
 from alglory.data.cache import BarCache, check_sufficiency
 from alglory.data.sample import generate_bars
 from alglory.evolve.fitness import FitnessConfig, OOSGate
@@ -67,6 +68,11 @@ class CampaignConfig(BaseModel):
         if v not in ("sample", "mt5"):
             raise ValueError("source must be 'sample' or 'mt5'")
         return v
+
+    @field_validator("symbols")
+    @classmethod
+    def _symbols(cls, v):
+        return [validate_symbol(s) for s in v]
 
 
 def _downsample(equity: np.ndarray, n: int = EQUITY_POINTS) -> list[float]:

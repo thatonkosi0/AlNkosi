@@ -210,3 +210,13 @@ def test_write_ea(tmp_path):
     path = write_ea(_gen(g), "MyBot", tmp_path)
     assert path.name == "MyBot.mq5"
     assert "OnTick" in path.read_text(encoding="utf-8")
+
+
+def test_generate_ea_rejects_invalid_symbol():
+    g = Genome(
+        "trend", "both",
+        SignalGene("ma_cross", {"fast": 12, "slow": 48}),
+        FILTERS, MGMT, RiskGene(0.01),
+    )
+    with pytest.raises(ValueError):
+        generate_ea(g, name="test", symbol='EUR"USD', timeframe="H1", guardrails=GUARD)

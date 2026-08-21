@@ -375,9 +375,14 @@ def create_app(cfg: AppConfig, *, token: str | None = None) -> FastAPI:
         metric. Uses cached bars; may take a while for a large set."""
         from alglory.analysis.robustness import rescore_vault
         from alglory.evolve.campaign import BARS_PER_YEAR
+        from alglory.validation import validate_symbol
 
         if timeframe not in BARS_PER_YEAR:
             raise HTTPException(422, f"Unknown timeframe {timeframe!r}; valid: {sorted(BARS_PER_YEAR)}")
+        try:
+            validate_symbol(symbol)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         return rescore_vault(vault(), BarCache(cfg.data_dir), symbol, timeframe, BARS_PER_YEAR[timeframe])
 
     @app.get("/api/insights")
@@ -403,13 +408,16 @@ def create_app(cfg: AppConfig, *, token: str | None = None) -> FastAPI:
 
         genome = Genome.from_json(row["genome_json"])
         name = row["name"].replace("-", "_")
-        code = generate_ea(
-            genome,
-            name=name,
-            symbol=row["symbol"],
-            timeframe=row["timeframe"],
-            guardrails=guard,
-        )
+        try:
+            code = generate_ea(
+                genome,
+                name=name,
+                symbol=row["symbol"],
+                timeframe=row["timeframe"],
+                guardrails=guard,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         if req.out_dir:
             out_dir, target, reason = Path(req.out_dir), "custom", None
         else:

@@ -1,6 +1,7 @@
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from alglory.data.cache import BarCache
 from alglory.evolve.campaign import CampaignConfig, run_campaign
@@ -221,3 +222,10 @@ def test_campaign_config_validation():
         CampaignConfig(symbols=["EURUSD"], timeframe="H1", tribes=["not_a_tribe"])
     with pytest.raises(Exception):
         CampaignConfig(symbols=["EURUSD"], timeframe="M3", tribes=["trend"])
+
+
+def test_campaign_rejects_invalid_symbol_characters():
+    with pytest.raises(ValidationError):
+        CampaignConfig(symbols=["../../etc"], timeframe="H1", tribes=["trend"])
+    with pytest.raises(ValidationError):
+        CampaignConfig(symbols=['EUR"USD'], timeframe="H1", tribes=["trend"])
