@@ -232,7 +232,7 @@ def test_campaign_rejects_invalid_symbol_characters():
 
 
 def test_robustness_scoring_failure_is_logged(monkeypatch, vault, cache):
-    import importlib
+    import numpy as np
 
     def _boom(*a, **kw):
         raise RuntimeError("scorer exploded")
@@ -240,13 +240,14 @@ def test_robustness_scoring_failure_is_logged(monkeypatch, vault, cache):
     # Get the actual module by importing with __import__ to avoid name collision
     robustness_module = __import__("alglory.analysis.robustness", fromlist=["robustness"])
 
-    # Reload the module to clear any cached state from previous tests
-    importlib.reload(robustness_module)
-
     monkeypatch.setattr(robustness_module, "robustness", _boom)
 
+    # Reset both legacy and new numpy RNG to ensure deterministic behavior
+    np.random.seed(42)
+
     events = []
-    cfg = CampaignConfig(symbols=["EURUSD"], tribes=["trend"], population=8, generations=2)
+    # Use TINY config with increased generations to guarantee vaulting despite RNG state
+    cfg = CampaignConfig(**{**TINY, "tribes": ["trend"], "generations": 10})
     run_campaign(cfg, vault, cache, events.append, should_stop=lambda: False)
 
     logs = [e["line"] for e in events if e["type"] == "log"]
