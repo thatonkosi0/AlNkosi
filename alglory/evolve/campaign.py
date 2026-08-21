@@ -205,6 +205,11 @@ def run_campaign(
                 )
             seed_genome = Genome.from_json(srow["genome_json"])
             seed_tribe = srow["tribe"]
+            if seed_tribe not in cfg.tribes:
+                raise RuntimeError(
+                    f"Strategy {cfg.seed_strategy_id}'s tribe {seed_tribe!r} is not in the "
+                    f"selected tribes {cfg.tribes}; add it or drop seed_strategy_id."
+                )
             emit(
                 {
                     "type": "log",

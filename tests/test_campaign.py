@@ -1,10 +1,12 @@
 import json
 
+import numpy as np
 import pytest
 from pydantic import ValidationError
 
 from alglory.data.cache import BarCache
 from alglory.evolve.campaign import CampaignConfig, run_campaign
+from alglory.genome import random_genome
 from alglory.vault.db import Vault
 
 
@@ -258,3 +260,23 @@ def test_robustness_scoring_failure_is_logged(monkeypatch, vault, cache):
 
     logs = [e["line"] for e in events if e["type"] == "log"]
     assert any("robustness scoring failed" in line for line in logs)
+
+
+def test_optimize_fails_loudly_when_seed_tribe_not_selected(vault, cache):
+    g = random_genome("trend", np.random.default_rng(0))
+    m = {"net_profit": 0.2, "max_drawdown": 0.1, "profit_factor": 1.5,
+         "sharpe": 1.0, "win_rate": 0.5, "trades": 40, "avg_yearly_return": 0.2}
+    sid = vault.add_strategy(
+        name=None, tribe="trend", symbol="EURUSD", timeframe="H1",
+        genome_json=g.to_json(), is_metrics=m, oos_metrics=m,
+        equity=np.linspace(1, 1.2, 30), campaign_id=None,
+    )
+    cfg = CampaignConfig(
+        symbols=["EURUSD"], tribes=["momentum"], population=8, generations=2,
+        seed_strategy_id=sid,
+    )
+    events = []
+    run_campaign(cfg, vault, cache, events.append, should_stop=lambda: False)
+    finished = next(e for e in events if e["type"] == "campaign_finished")
+    assert finished["status"] == "failed"
+    assert "not in the selected tribes" in (finished["error"] or "")
