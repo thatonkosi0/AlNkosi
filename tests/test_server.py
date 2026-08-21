@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from alglory.config import AppConfig
 from alglory.evolve.campaign import CampaignConfig
@@ -51,10 +52,12 @@ def app_client(tmp_path):
     (tmp_path / "ui").mkdir()
     (tmp_path / "ui" / "index.html").write_text("<html>ALGLORY</html>")
     cfg = AppConfig(data_dir=tmp_path, db_path=tmp_path / "vault.db", ui_dir=tmp_path / "ui")
-    app = create_app(cfg)
+    app = create_app(cfg, token="test-token")
     fake = FakeManager()
     app.state.manager = fake
-    return TestClient(app), fake, cfg
+    client = TestClient(app)
+    client.headers.update({"X-Alglory-Token": "test-token"})
+    return client, fake, cfg
 
 
 def _seed_strategy(cfg, tribe="trend", net=0.3):
@@ -425,7 +428,7 @@ def test_executor_stop_and_status(app_client):
 
 def test_websocket_hello(app_client):
     client, fake, cfg = app_client
-    with client.websocket_connect("/ws/events") as ws:
+    with client.websocket_connect("/ws/events?token=test-token") as ws:
         msg = ws.receive_json()
         assert msg["type"] == "hello"
         assert msg["campaign"] is None
@@ -436,3 +439,70 @@ def test_static_ui_served(app_client):
     r = client.get("/")
     assert r.status_code == 200
     assert "ALGLORY" in r.text
+
+
+def test_api_rejects_missing_or_wrong_token(app_client):
+    client, fake, cfg = app_client
+    bare = TestClient(client.app)
+    assert bare.get("/api/status").status_code == 401
+    bare.headers.update({"X-Alglory-Token": "wrong"})
+    assert bare.get("/api/status").status_code == 401
+    bare.headers.update({"X-Alglory-Token": "test-token"})
+    assert bare.get("/api/status").status_code == 200
+
+
+def test_static_ui_unprotected_without_token(app_client):
+    client, fake, cfg = app_client
+    bare = TestClient(client.app)
+    assert bare.get("/").status_code == 200  # the UI itself needs no token to load
+
+
+def test_websocket_requires_token(app_client):
+    client, fake, cfg = app_client
+    bare = TestClient(client.app)
+    with pytest.raises(WebSocketDisconnect):
+        with bare.websocket_connect("/ws/events"):
+            pass
+
+
+# A malformed token must fail closed with a clean 401 — never an unhandled
+# 500. secrets.compare_digest raises TypeError on non-ASCII str, and decoding
+# raw invalid-UTF-8 header bytes raises UnicodeDecodeError; both are reachable
+# from a browser address bar in the one module that gatekeeps live trading.
+@pytest.mark.parametrize(
+    "query_token",
+    [
+        "%C3%A9",        # valid UTF-8, non-ASCII -> compare_digest TypeError
+        "%FF",           # invalid UTF-8 byte    -> UnicodeDecodeError
+        "%FF%FE%00",     # invalid UTF-8 + NUL
+        "caf%C3%A9",     # non-ASCII mixed with ASCII
+        "%E2%82%AC" * 8,  # longer non-ASCII payload
+    ],
+)
+def test_malformed_query_token_is_a_clean_401(app_client, query_token):
+    client, fake, cfg = app_client
+    bare = TestClient(client.app)
+    r = bare.get(f"/api/status?token={query_token}")
+    assert r.status_code == 401
+
+
+@pytest.mark.parametrize("header_bytes", [b"\xc3\xa9", b"\xff", b"\xff\xfe"])
+def test_malformed_header_token_is_a_clean_401(app_client, header_bytes):
+    client, fake, cfg = app_client
+    bare = TestClient(client.app)
+    r = bare.get("/api/status", headers={b"X-Alglory-Token": header_bytes})
+    assert r.status_code == 401
+
+
+def test_malformed_token_does_not_break_the_websocket_gate(app_client):
+    client, fake, cfg = app_client
+    bare = TestClient(client.app)
+    with pytest.raises(WebSocketDisconnect):
+        with bare.websocket_connect("/ws/events?token=%FF"):
+            pass
+
+
+def test_correct_token_still_accepted_after_hardening(app_client):
+    client, fake, cfg = app_client
+    bare = TestClient(client.app)
+    assert bare.get("/api/status?token=test-token").status_code == 200

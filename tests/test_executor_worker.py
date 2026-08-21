@@ -139,3 +139,84 @@ def test_bar_clock_returns_none_on_fetch_error():
             raise RuntimeError("no terminal")
 
     assert MT5BarClock(_BadSource()).latest_closed_bars("EURUSD", "H1") is None
+
+
+def test_clock_captures_last_error_on_fetch_failure():
+    class _BadSource:
+        def fetch_bars(self, *a):
+            raise RuntimeError("no terminal")
+
+    clock = MT5BarClock(_BadSource())
+    assert clock.latest_closed_bars("EURUSD", "H1") is None
+    assert "no terminal" in clock.last_error
+
+
+def test_tick_emits_warning_on_fetch_failure():
+    class _FailClock:
+        last_error = "no terminal"
+
+        def latest_closed_bars(self, symbol, timeframe):
+            return None
+
+    ex = LiveExecutor(FakeMT5Source(balance=100_000), [_rt()], mode=Mode.DEMO)
+    m = ExecutorManager()
+    m.arm(ex, _FailClock(), start=False)
+    m.tick()
+    events = m.drain()
+    assert any(e["type"] == "executor_warning" and "no terminal" in e["message"] for e in events)
+
+
+def test_manager_drains_execution_errors_as_events():
+    """Verify that execution_errors are drained as executor_error events in the queue."""
+    frame = generate_bars("EURUSD", "H1", 260, seed=7).iloc[:250].reset_index(drop=True)
+    ex = LiveExecutor(FakeMT5Source(balance=100_000), [_rt()], mode=Mode.DEMO)
+    m = ExecutorManager()
+    m.arm(ex, _FixedClock(frame), start=False)
+
+    # Inject a synthetic execution error into the executor's error list
+    ex.execution_errors.append({
+        "magic": MAGIC,
+        "symbol": "EURUSD",
+        "action": "open_long",
+        "message": "rejected: market closed"
+    })
+
+    # Tick to process and drain errors
+    m.tick()
+    events = m.drain()
+
+    # Find the executor_error event
+    error_events = [e for e in events if e.get("type") == "executor_error"]
+    assert len(error_events) == 1
+
+    # Verify the error event has the correct structure
+    err = error_events[0]
+    assert err["magic"] == MAGIC
+    assert err["symbol"] == "EURUSD"
+    assert err["action"] == "open_long"
+    assert err["message"] == "rejected: market closed"
+
+    # Verify the error list was cleared after draining
+    assert len(ex.execution_errors) == 0
+
+
+def test_manager_drains_execution_warnings_as_events():
+    """A non-fatal executor anomaly (e.g. adopting a position after a restart)
+    must reach the operator as an executor_warning, not die in the executor."""
+    frame = generate_bars("EURUSD", "H1", 260, seed=7).iloc[:250].reset_index(drop=True)
+    ex = LiveExecutor(FakeMT5Source(balance=100_000), [_rt()], mode=Mode.DEMO)
+    m = ExecutorManager()
+    m.arm(ex, _FixedClock(frame), start=False)
+
+    ex.execution_warnings.append(
+        {"magic": MAGIC, "symbol": "EURUSD", "message": "adopted an already-open long position"}
+    )
+    m.tick()
+    events = m.drain()
+
+    warnings = [e for e in events if e.get("type") == "executor_warning"]
+    assert len(warnings) == 1
+    assert warnings[0]["magic"] == MAGIC
+    assert warnings[0]["symbol"] == "EURUSD"
+    assert "adopted" in warnings[0]["message"]
+    assert len(ex.execution_warnings) == 0  # drained, not re-emitted forever

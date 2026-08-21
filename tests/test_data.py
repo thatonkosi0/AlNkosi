@@ -75,3 +75,30 @@ def test_check_sufficiency_raises_with_counts():
 def test_check_sufficiency_raises_on_none():
     with pytest.raises(InsufficientDataError):
         check_sufficiency(None, min_bars=10)
+
+
+def test_bar_cache_rejects_invalid_symbol(tmp_path):
+    from alglory.data.cache import BarCache
+
+    cache = BarCache(tmp_path)
+    with pytest.raises(ValueError):
+        cache._path("../../etc/passwd", "H1")
+
+
+def test_bar_cache_rejects_symbol_with_trailing_newline(tmp_path):
+    """Regression test: trailing newlines must be rejected.
+
+    Without fullmatch(), the pattern ^...*$ with match() would allow
+    "EURUSD\n" because $ matches "just before the newline", not the
+    actual end of the string. This would embed a raw newline in the
+    parquet filename and break MQL5 string interpolation.
+    """
+    from alglory.data.cache import BarCache
+
+    cache = BarCache(tmp_path)
+    with pytest.raises(ValueError):
+        cache._path("EURUSD\n", "H1")
+    with pytest.raises(ValueError):
+        cache._path("EURUSD\t", "H1")
+    with pytest.raises(ValueError):
+        cache._path("EURUSD ", "H1")

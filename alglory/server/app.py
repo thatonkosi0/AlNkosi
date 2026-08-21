@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from alglory.indicators import atr
 from alglory.evolve.campaign import CampaignConfig
 from alglory.genome import Genome
 from alglory.live.executor import ExecutorError, StrategyRuntime
+from alglory.server.auth import TokenAuthMiddleware
 from alglory.server.executor_worker import ExecutorManager
 from alglory.server.worker import BusyError, CampaignManager
 from alglory.vault.db import Vault
@@ -148,7 +150,7 @@ def _deploy_instructions(path: Path, name: str, row: dict, target: str, reason: 
     )
 
 
-def create_app(cfg: AppConfig) -> FastAPI:
+def create_app(cfg: AppConfig, *, token: str | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         # Single drainer: keeps the worker's event queue flowing even with no
@@ -178,9 +180,11 @@ def create_app(cfg: AppConfig) -> FastAPI:
 
     app = FastAPI(title="Alglory", version="0.1.0", lifespan=lifespan)
     app.state.cfg = cfg
+    app.state.token = token or secrets.token_urlsafe(24)
     app.state.manager = CampaignManager(cfg.db_path, cfg.data_dir)
     app.state.executor = ExecutorManager()
     app.state.sockets = set()
+    app.add_middleware(TokenAuthMiddleware, token=app.state.token)
 
     def vault() -> Vault:
         return Vault(cfg.db_path)
@@ -365,16 +369,24 @@ def create_app(cfg: AppConfig) -> FastAPI:
         return {"status": "deleted"}
 
     @app.post("/api/vault/rescore")
-    def vault_rescore(symbol: str, timeframe: str):
+    def vault_rescore(symbol: str, timeframe: str, commission_per_lot: float = 0.0):
         """Recompute + persist walk-forward robustness for a symbol/timeframe so
         the vault can rank by trustworthiness instead of the overfit-prone OOS
         metric. Uses cached bars; may take a while for a large set."""
         from alglory.analysis.robustness import rescore_vault
         from alglory.evolve.campaign import BARS_PER_YEAR
+        from alglory.validation import validate_symbol
 
         if timeframe not in BARS_PER_YEAR:
             raise HTTPException(422, f"Unknown timeframe {timeframe!r}; valid: {sorted(BARS_PER_YEAR)}")
-        return rescore_vault(vault(), BarCache(cfg.data_dir), symbol, timeframe, BARS_PER_YEAR[timeframe])
+        try:
+            validate_symbol(symbol)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return rescore_vault(
+            vault(), BarCache(cfg.data_dir), symbol, timeframe, BARS_PER_YEAR[timeframe],
+            commission_per_lot=commission_per_lot,
+        )
 
     @app.get("/api/insights")
     def insights():
@@ -399,13 +411,16 @@ def create_app(cfg: AppConfig) -> FastAPI:
 
         genome = Genome.from_json(row["genome_json"])
         name = row["name"].replace("-", "_")
-        code = generate_ea(
-            genome,
-            name=name,
-            symbol=row["symbol"],
-            timeframe=row["timeframe"],
-            guardrails=guard,
-        )
+        try:
+            code = generate_ea(
+                genome,
+                name=name,
+                symbol=row["symbol"],
+                timeframe=row["timeframe"],
+                guardrails=guard,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         if req.out_dir:
             out_dir, target, reason = Path(req.out_dir), "custom", None
         else:

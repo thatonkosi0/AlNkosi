@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from alglory.genome import Genome
+from alglory.validation import validate_symbol
 
 
 @dataclass(frozen=True)
@@ -145,6 +146,7 @@ def generate_ea(
     timeframe: str,
     guardrails: Guardrails,
 ) -> str:
+    symbol = validate_symbol(symbol)
     g = genome
     p = g.signal.params
     use_session = g.filters.session is not None

@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from alglory.validation import validate_symbol
+
 
 class InsufficientDataError(Exception):
     """Raised when available history cannot support the requested campaign."""
@@ -18,7 +20,7 @@ class BarCache:
         self._dir.mkdir(parents=True, exist_ok=True)
 
     def _path(self, symbol: str, timeframe: str) -> Path:
-        return self._dir / f"{symbol}_{timeframe}.parquet"
+        return self._dir / f"{validate_symbol(symbol)}_{timeframe}.parquet"
 
     def save(self, symbol: str, timeframe: str, df: pd.DataFrame) -> None:
         df.to_parquet(self._path(symbol, timeframe), index=False)

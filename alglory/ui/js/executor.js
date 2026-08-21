@@ -20,7 +20,18 @@ export function executorHandleEvent(event) {
       refreshExecutorStatus().catch(() => {});
     }
   } else if (event.type === "executor_error") {
-    line(`   !! executor error: ${event.error}`);
+    // Two different shapes arrive under this type. The worker thread's
+    // unhandled-exception guard sends {error}; per-order rejections drained
+    // from LiveExecutor.execution_errors send {magic, symbol, action, message}.
+    // Reading only .error printed "undefined" for every rejected order.
+    const detail =
+      event.error ??
+      `[${event.symbol}#${event.magic}] ${event.action} rejected — ${event.message}`;
+    line(`   !! executor error: ${detail}`);
+  } else if (event.type === "executor_warning") {
+    // Non-fatal anomalies: bar-fetch/connectivity loss from the worker, and
+    // executor-side advisories (e.g. adopting a position after a restart).
+    line(`   ! [${event.symbol}#${event.magic}] ${event.message}`);
   }
 }
 

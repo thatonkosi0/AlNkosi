@@ -17,11 +17,28 @@ function cycleFx() {
   document.getElementById("fx-toggle").textContent = `FX: ${next}`;
 }
 
+// ---- auth token --------------------------------------------------------
+const urlToken = new URLSearchParams(location.search).get("token");
+if (urlToken) {
+  sessionStorage.setItem("alglory_token", urlToken);
+  const url = new URL(location.href);
+  url.searchParams.delete("token");
+  history.replaceState({}, "", url);
+}
+function authToken() {
+  return sessionStorage.getItem("alglory_token") || "";
+}
+
 // ---- API helper ------------------------------------------------------
 export async function api(path, opts = {}) {
+  const { headers: extraHeaders, ...rest } = opts;
   const res = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    ...opts,
+    ...rest,
+    headers: {
+      "Content-Type": "application/json",
+      "X-Alglory-Token": authToken(),
+      ...extraHeaders,
+    },
   });
   if (!res.ok) {
     let detail = res.statusText;
@@ -61,7 +78,7 @@ function routeFromHash() {
 let backoff = 500;
 function connectWS() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws/events`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws/events?token=${encodeURIComponent(authToken())}`);
   ws.onopen = () => { backoff = 500; };
   ws.onmessage = (msg) => {
     const event = JSON.parse(msg.data);

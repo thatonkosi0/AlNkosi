@@ -16,6 +16,7 @@ import numpy as np
 from pydantic import BaseModel, Field, field_validator
 
 from alglory.backtest.engine import Costs
+from alglory.validation import validate_symbol
 from alglory.data.cache import BarCache, check_sufficiency
 from alglory.data.sample import generate_bars
 from alglory.evolve.fitness import FitnessConfig, OOSGate
@@ -67,6 +68,11 @@ class CampaignConfig(BaseModel):
         if v not in ("sample", "mt5"):
             raise ValueError("source must be 'sample' or 'mt5'")
         return v
+
+    @field_validator("symbols")
+    @classmethod
+    def _symbols(cls, v):
+        return [validate_symbol(s) for s in v]
 
 
 def _downsample(equity: np.ndarray, n: int = EQUITY_POINTS) -> list[float]:
@@ -199,6 +205,11 @@ def run_campaign(
                 )
             seed_genome = Genome.from_json(srow["genome_json"])
             seed_tribe = srow["tribe"]
+            if seed_tribe not in cfg.tribes:
+                raise RuntimeError(
+                    f"Strategy {cfg.seed_strategy_id}'s tribe {seed_tribe!r} is not in the "
+                    f"selected tribes {cfg.tribes}; add it or drop seed_strategy_id."
+                )
             emit(
                 {
                     "type": "log",
@@ -287,8 +298,8 @@ def run_campaign(
                             )
                             vault.set_robustness(sid, r["grade"], r["score"])
                             grade = r["grade"]
-                        except Exception:  # noqa: BLE001 - scoring must not abort a campaign
-                            pass
+                        except Exception as exc:  # noqa: BLE001 - scoring must not abort a campaign
+                            emit({"type": "log", "line": f"robustness scoring failed for strategy {sid}: {exc}"})
                         vaulted_total += 1
                         row = vault.get_strategy(sid)
                         emit(

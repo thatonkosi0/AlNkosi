@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from alglory.analysis.robustness import _score, rescore_vault, robustness
 from alglory.backtest.engine import Costs
@@ -111,3 +112,16 @@ def test_unscored_strategies_sort_last(tmp_path):
     assert ranked[0]["id"] == scored_id
     assert ranked[-1]["id"] == unscored_id
     assert ranked[-1]["robustness_score"] is None
+
+
+def test_rescore_vault_derives_spread_from_cached_bars(tmp_path):
+    """Regression: rescore must not hardcode a fixed spread that can diverge
+    from what the campaign actually vaulted the strategy with."""
+    vault = Vault(tmp_path / "v.db")
+    bars = generate_bars("EURUSD", "H1", 3000, seed=7)
+    sid = _seed(vault, _genome())
+    rescore_vault(vault, _Cache(bars), "EURUSD", "H1", BPY, commission_per_lot=0.00005)
+    row = vault.get_strategy(sid)
+    expected_costs = Costs(spread=float(bars["spread"].median()), commission_per_lot=0.00005)
+    expected = robustness(_genome(), bars, expected_costs, BPY, timeframe="H1")
+    assert row["robustness_score"] == pytest.approx(expected["score"])

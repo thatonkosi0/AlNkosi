@@ -81,16 +81,22 @@ def robustness(
         }
 
 
-def rescore_vault(vault, cache, symbol: str, timeframe: str, bars_per_year: float) -> dict:
+def rescore_vault(
+    vault, cache, symbol: str, timeframe: str, bars_per_year: float,
+    *, commission_per_lot: float = 0.0,
+) -> dict:
     """Compute + persist robustness for every vaulted strategy of one symbol/tf.
 
-    Loads the cached bars once and scores each genome against them. Returns
-    {scored, skipped} — skipped are strategies with no cached bars to score on.
+    Loads the cached bars once and scores each genome against them. Costs are
+    derived from the same cached bars (median spread) rather than a fixed
+    guess, so a rescore reproduces roughly what the campaign that vaulted the
+    strategy actually used. Returns {scored, skipped} -- skipped are
+    strategies with no cached bars to score on.
     """
     bars = cache.load(symbol, timeframe)
     if bars is None or len(bars) < 50:
         return {"scored": 0, "skipped": 0, "reason": "no cached bars for this symbol/timeframe"}
-    costs = Costs(spread=0.0001)
+    costs = Costs(spread=float(bars["spread"].median()), commission_per_lot=commission_per_lot)
     rows = vault.list_strategies(symbol=symbol, timeframe=timeframe, limit=100_000)
     scored = 0
     for row in rows:
