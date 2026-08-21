@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from alglory.config import AppConfig
 from alglory.evolve.campaign import CampaignConfig
@@ -51,10 +52,12 @@ def app_client(tmp_path):
     (tmp_path / "ui").mkdir()
     (tmp_path / "ui" / "index.html").write_text("<html>ALGLORY</html>")
     cfg = AppConfig(data_dir=tmp_path, db_path=tmp_path / "vault.db", ui_dir=tmp_path / "ui")
-    app = create_app(cfg)
+    app = create_app(cfg, token="test-token")
     fake = FakeManager()
     app.state.manager = fake
-    return TestClient(app), fake, cfg
+    client = TestClient(app)
+    client.headers.update({"X-Alglory-Token": "test-token"})
+    return client, fake, cfg
 
 
 def _seed_strategy(cfg, tribe="trend", net=0.3):
@@ -425,7 +428,7 @@ def test_executor_stop_and_status(app_client):
 
 def test_websocket_hello(app_client):
     client, fake, cfg = app_client
-    with client.websocket_connect("/ws/events") as ws:
+    with client.websocket_connect("/ws/events?token=test-token") as ws:
         msg = ws.receive_json()
         assert msg["type"] == "hello"
         assert msg["campaign"] is None
@@ -436,3 +439,27 @@ def test_static_ui_served(app_client):
     r = client.get("/")
     assert r.status_code == 200
     assert "ALGLORY" in r.text
+
+
+def test_api_rejects_missing_or_wrong_token(app_client):
+    client, fake, cfg = app_client
+    bare = TestClient(client.app)
+    assert bare.get("/api/status").status_code == 401
+    bare.headers.update({"X-Alglory-Token": "wrong"})
+    assert bare.get("/api/status").status_code == 401
+    bare.headers.update({"X-Alglory-Token": "test-token"})
+    assert bare.get("/api/status").status_code == 200
+
+
+def test_static_ui_unprotected_without_token(app_client):
+    client, fake, cfg = app_client
+    bare = TestClient(client.app)
+    assert bare.get("/").status_code == 200  # the UI itself needs no token to load
+
+
+def test_websocket_requires_token(app_client):
+    client, fake, cfg = app_client
+    bare = TestClient(client.app)
+    with pytest.raises(WebSocketDisconnect):
+        with bare.websocket_connect("/ws/events"):
+            pass

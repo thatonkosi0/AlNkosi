@@ -15,8 +15,9 @@ POLL_S = 0.25
 @pytest.fixture
 def client(tmp_path):
     cfg = AppConfig(data_dir=tmp_path, db_path=tmp_path / "vault.db", ui_dir=UI_DIR)
-    app = create_app(cfg)
+    app = create_app(cfg, token="test-token")
     with TestClient(app) as c:  # context manager runs the lifespan pump
+        c.headers.update({"X-Alglory-Token": "test-token"})
         yield c
 
 

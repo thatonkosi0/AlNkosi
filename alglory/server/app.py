@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from alglory.indicators import atr
 from alglory.evolve.campaign import CampaignConfig
 from alglory.genome import Genome
 from alglory.live.executor import ExecutorError, StrategyRuntime
+from alglory.server.auth import TokenAuthMiddleware
 from alglory.server.executor_worker import ExecutorManager
 from alglory.server.worker import BusyError, CampaignManager
 from alglory.vault.db import Vault
@@ -148,7 +150,7 @@ def _deploy_instructions(path: Path, name: str, row: dict, target: str, reason: 
     )
 
 
-def create_app(cfg: AppConfig) -> FastAPI:
+def create_app(cfg: AppConfig, *, token: str | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         # Single drainer: keeps the worker's event queue flowing even with no
@@ -178,9 +180,11 @@ def create_app(cfg: AppConfig) -> FastAPI:
 
     app = FastAPI(title="Alglory", version="0.1.0", lifespan=lifespan)
     app.state.cfg = cfg
+    app.state.token = token or secrets.token_urlsafe(24)
     app.state.manager = CampaignManager(cfg.db_path, cfg.data_dir)
     app.state.executor = ExecutorManager()
     app.state.sockets = set()
+    app.add_middleware(TokenAuthMiddleware, token=app.state.token)
 
     def vault() -> Vault:
         return Vault(cfg.db_path)
