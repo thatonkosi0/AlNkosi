@@ -220,3 +220,16 @@ def test_generate_ea_rejects_invalid_symbol():
     )
     with pytest.raises(ValueError):
         generate_ea(g, name="test", symbol='EUR"USD', timeframe="H1", guardrails=GUARD)
+
+
+def test_ea_magic_is_per_strategy():
+    g = Genome(
+        "trend", "both",
+        SignalGene("ma_cross", {"fast": 12, "slow": 48}),
+        FILTERS, MGMT, RiskGene(0.01),
+    )
+    code = generate_ea(
+        g, name="TestEA", symbol="EURUSD", timeframe="H1", guardrails=GUARD, magic=990245
+    )
+    assert "InpMagic = 990245;" in code
+    assert "InpMagic = 990117;" not in code

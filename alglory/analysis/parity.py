@@ -299,6 +299,7 @@ def export_bundle(
     costs: Costs,
     bars_per_year: float,
     out_dir: Path,
+    magic: int = 990117,
 ) -> dict:
     """Write the full reproduce-in-MT5 bundle; return the emitted paths + summary.
 
@@ -317,7 +318,8 @@ def export_bundle(
 
     ea_path = write_ea(
         generate_ea(
-            genome, name=name, symbol=symbol, timeframe=timeframe, guardrails=guardrails
+            genome, name=name, symbol=symbol, timeframe=timeframe,
+            guardrails=guardrails, magic=magic,
         ),
         name,
         out_dir,

@@ -145,6 +145,7 @@ def generate_ea(
     symbol: str,
     timeframe: str,
     guardrails: Guardrails,
+    magic: int = 990117,
 ) -> str:
     symbol = validate_symbol(symbol)
     g = genome
@@ -190,7 +191,7 @@ def generate_ea(
 #property version   "1.00"
 #include <Trade/Trade.mqh>
 
-input long   InpMagic = 990117;
+input long   InpMagic = {int(magic)};
 input double InpRiskPct = {_flt(guardrails.risk_pct)};      // risk per trade (fraction of balance)
 input double InpDailyLossPct = {_flt(guardrails.daily_loss_pct)}; // daily loss halt (fraction)
 input double InpMaxDDPct = {_flt(guardrails.max_dd_pct)};    // max drawdown permanent halt (fraction)

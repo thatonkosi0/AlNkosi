@@ -418,6 +418,7 @@ def create_app(cfg: AppConfig, *, token: str | None = None) -> FastAPI:
                 symbol=row["symbol"],
                 timeframe=row["timeframe"],
                 guardrails=guard,
+                magic=_EXECUTOR_MAGIC_BASE + sid,
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc

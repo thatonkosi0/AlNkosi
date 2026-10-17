@@ -506,3 +506,13 @@ def test_correct_token_still_accepted_after_hardening(app_client):
     client, fake, cfg = app_client
     bare = TestClient(client.app)
     assert bare.get("/api/status?token=test-token").status_code == 200
+
+
+def test_deploy_uses_strategy_magic(app_client):
+    from pathlib import Path
+
+    client, fake, cfg = app_client
+    sid = _seed_strategy(cfg)
+    body = client.post(f"/api/deploy/{sid}", json={"preset": "personal"}).json()
+    code = Path(body["path"]).read_text(encoding="utf-8")
+    assert f"InpMagic = {990000 + sid};" in code
