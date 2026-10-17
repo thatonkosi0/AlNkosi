@@ -116,8 +116,10 @@
   - `CampaignConfig.cost_overrides: dict[str, dict[str, float]] = {}`. Remove `min_spread_pips` and `commission_per_lot` fields; stored configs containing them still parse (ignored).
   - `_load_bars(cfg, symbol, timeframe, cache, emit) -> tuple[pd.DataFrame, Costs]` — MT5: `Costs(spread=effective_spread(bars, floor=max(profile.min_spread, src.symbol_spread(symbol))), commission=commission_price(profile.commission_per_lot, src.symbol_spec(symbol)))`; sample: `Costs(spread=effective_spread(bars), commission=0.0)`. Emit a log line with the spread and commission used.
   - `rescore_vault(..., *, commission: float = 0.0)` (price units).
+  - History pull in `_load_bars` (MT5): request **50,000** bars (survey 2026-10-17: M15 reaches Oct 2024, H1 reaches 2018 at that size); when `fetch_bars` raises or returns nothing ("Terminal: Call failed" was seen for every H4 request and for NZDUSD), retry with half the count, down to `MIN_BARS`, then let the error propagate (Task 6 turns it into a skip).
 
 - [ ] **Step 1: Write the failing tests** in `tests/test_costs.py`:
+  - `test_load_bars_halves_request_on_terminal_failure`: a fake source whose `fetch_bars` fails above 12,500 bars → `_load_bars` returns 12,500 bars after the 50,000 → 25,000 → 12,500 retries.
   - `test_profiles_by_market`: EURUSD → (0.0001, 7.0); USDJPY → (0.01, 7.0); XAUUSD → (0.25, 7.0); NAS100 and USTEC → (1.5, 0.0).
   - `test_commission_to_price_units`: tick_size 1e-5, tick_value 1.0, $7 → `7e-5`.
   - `test_costs_round_trip_adds_price_units`: `Costs(spread=1e-4, commission=7e-5).round_trip == pytest.approx(1.7e-4)`.
@@ -304,7 +306,7 @@
 **Interfaces:**
 - Consumes: Tasks 5, 6, 10.
 - Produces:
-  - CONTROL: M15/H1/H4 checkboxes (all on by default); symbols prefilled `EURUSD,GBPUSD,USDJPY,USDCHF,AUDUSD,USDCAD,NZDUSD,XAUUSD` (owner appends the broker's Nasdaq name); target-preset select; `keep_per_market` and `min_holdout_trades` inputs; posts `timeframes`.
+  - CONTROL: M15/H1/H4 checkboxes (all on by default); symbols prefilled `EURUSD,GBPUSD,USDJPY,USDCHF,AUDUSD,USDCAD,NZDUSD,XAUUSD,USTEC` (`USTEC` is Nasdaq on the owner's MetaQuotes-Demo account); target-preset select; `keep_per_market` and `min_holdout_trades` inputs; posts `timeframes`.
   - VAULT: stage badge, stage filter, "show legacy" toggle (off by default), holdout win %, PF and trades as headline columns, "legacy — no holdout" label, "Refresh demo results" button rendering per-strategy demo stats and the account panel (worst day, drawdown, breaches; the 503 message when MT5 is closed).
   - Arm flow calls `/api/executor/precheck` and shows breaches/exclusions before confirming.
   - `GET /api/strategies?stage=&include_legacy=` → `Vault.list_strategies(stage=..., include_legacy=...)`.
