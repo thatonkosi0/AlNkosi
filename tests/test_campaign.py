@@ -269,6 +269,8 @@ def test_robustness_scoring_failure_is_logged(monkeypatch, vault, cache):
             yield result
 
     monkeypatch.setattr(campaign_mod, "evolve_tribe", _evolve_tribe_with_one_vault)
+    # vaulting now happens only after the holdout stage: pass it deterministically
+    _fake_judge(monkeypatch)
 
     events = []
     cfg = CampaignConfig(
@@ -366,3 +368,222 @@ def test_resume_state_includes_timeframe():
     # old checkpoints without a timeframe resume at the first timeframe
     ckpt = {"symbol": "EURUSD", "tribe": "trend", "gen": 1, "population": None}
     assert _resume_state(cfg, ckpt)[1] == 0
+
+
+# -- Task 6: finalists, once-per-market holdout, keep-best, skips, optimise --
+
+import alglory.evolve.campaign as campaign_mod  # noqa: E402
+import alglory.evolve.holdout as holdout_mod  # noqa: E402
+from alglory.backtest.metrics import Metrics  # noqa: E402
+from alglory.data.cache import InsufficientDataError  # noqa: E402
+from alglory.evolve.holdout import Finalist, HoldoutResult  # noqa: E402
+
+
+def _force_finalists(monkeypatch, spy=None):
+    """Make each generation's top genome a select-passer, so campaign tests
+    have finalists without depending on GA luck (Ruling B)."""
+    real = campaign_mod.evolve_tribe
+
+    def wrapped(*args, **kwargs):
+        if spy is not None:
+            spy.append((args, kwargs))
+        for result in real(*args, **kwargs):
+            result.vaulted = [(result.top.genome, result.top.is_metrics, result.top.is_metrics)]
+            yield result
+
+    monkeypatch.setattr(campaign_mod, "evolve_tribe", wrapped)
+
+
+def _fake_judge(monkeypatch, passed=True):
+    """Deterministic holdout verdicts; each call scores higher than the last."""
+    calls = []
+
+    def judge(f, holdout_bars, costs, gate, preset, bars_per_year):
+        calls.append(f)
+        win = 0.61 + 0.001 * len(calls)
+        m = Metrics(net_profit=0.1, max_drawdown=0.05, profit_factor=1.5, sharpe=1.0,
+                    win_rate=win, trades=60, avg_yearly_return=0.1)
+        return HoldoutResult(finalist=f, metrics=m,
+                             records=[{"exit_time": "2024-01-01T00:00:00", "r": 1.0}],
+                             passed=passed, reasons=[] if passed else ["test says no"])
+
+    monkeypatch.setattr(campaign_mod, "judge_finalist", judge)
+    return calls
+
+
+def _logs(events):
+    return [e["line"] for e in events if e["type"] == "log"]
+
+
+def _verdicts(events):
+    return [line for line in _logs(events)
+            if ": holdout pass" in line or ": holdout fail" in line]
+
+
+def test_holdout_runs_once_per_market_after_all_units(vault, cache, monkeypatch):
+    events = []
+    evolve_calls = []
+    _force_finalists(monkeypatch, spy=evolve_calls)
+    # real judge_finalist; the pass decision only checks the trade floor
+    monkeypatch.setattr(holdout_mod, "holdout_pass", lambda m, g: m.trades >= g.min_trades)
+    real_judge = campaign_mod.judge_finalist
+    judged = []
+
+    def spy_judge(f, holdout_bars, *a, **kw):
+        judged.append((len(events), f.key, f.timeframe, holdout_bars["time"].min()))
+        return real_judge(f, holdout_bars, *a, **kw)
+
+    monkeypatch.setattr(campaign_mod, "judge_finalist", spy_judge)
+    cfg = CampaignConfig(**dict(TINY, timeframes=["H1", "H4"], min_holdout_trades=5))
+    run_campaign(cfg, vault, cache, events.append, should_stop=lambda: False)
+    assert events[-1]["status"] == "done"
+
+    last_gen = max(i for i, e in enumerate(events) if e["type"] == "generation")
+    vaulted_at = [i for i, e in enumerate(events) if e["type"] == "strategy_vaulted"]
+    assert all(i > last_gen for i in vaulted_at)
+
+    # every finalist judged exactly once, all after the market's last unit
+    assert judged, "forced finalists must reach the holdout stage"
+    keys = [k for _, k, _, _ in judged]
+    assert len(keys) == len(set(keys))
+    assert all(n > last_gen for n, _, _, _ in judged)
+    assert len(_verdicts(events)) == len(judged)
+
+    # the GA never saw a holdout bar
+    holdout_start = {tf: t for _, _, tf, t in judged}
+    for args, kwargs in evolve_calls:
+        breed, select = args[1], args[2]
+        tf = next(t for t, bpy in campaign_mod.BARS_PER_YEAR.items()
+                  if bpy == kwargs["bars_per_year"])
+        if tf in holdout_start:
+            assert breed["time"].max() < holdout_start[tf]
+            assert select["time"].max() < holdout_start[tf]
+
+    for row in vault.list_strategies(limit=500):
+        assert row["stage"] == "holdout_passed"
+        assert row["ho_trades"] >= 5
+
+
+def test_keep_per_market_respected(vault, cache, monkeypatch):
+    _force_finalists(monkeypatch)
+    calls = _fake_judge(monkeypatch)
+    events = _run(dict(TINY, symbols=["EURUSD", "GBPUSD"], keep_per_market=1), vault, cache)
+    assert events[-1]["status"] == "done"
+    assert calls
+    n_eur = sum(1 for line in _verdicts(events) if line.startswith("EURUSD"))
+    best = {"EURUSD": 0.61 + 0.001 * n_eur, "GBPUSD": 0.61 + 0.001 * len(calls)}
+    for sym in ("EURUSD", "GBPUSD"):
+        rows = vault.list_strategies(symbol=sym, limit=500)
+        assert len(rows) == 1  # forced passers exist, so exactly the cap
+        assert rows[0]["stage"] == "holdout_passed"
+        assert rows[0]["ho_win_rate"] == pytest.approx(best[sym])  # the best one kept
+    # EURUSD is vaulted before GBPUSD starts breeding
+    eur_vault = next(i for i, e in enumerate(events)
+                     if e["type"] == "strategy_vaulted" and e["symbol"] == "EURUSD")
+    gbp_gen = next(i for i, e in enumerate(events)
+                   if e["type"] == "generation" and e["symbol"] == "GBPUSD")
+    assert eur_vault < gbp_gen
+
+
+def test_failed_holdout_vaults_nothing_and_logs_reasons(vault, cache, monkeypatch):
+    _force_finalists(monkeypatch)
+    _fake_judge(monkeypatch, passed=False)
+    events = _run(TINY, vault, cache)
+    assert events[-1]["status"] == "done"
+    assert vault.count() == 0
+    assert any("holdout fail" in line and "test says no" in line for line in _logs(events))
+
+
+def test_insufficient_history_skips_unit_not_campaign(vault, cache, monkeypatch):
+    real = campaign_mod._load_bars
+
+    def load(cfg, symbol, timeframe, cache, emit):
+        if timeframe == "H4":
+            raise InsufficientDataError("Only 10 bars of history available")
+        return real(cfg, symbol, timeframe, cache, emit)
+
+    monkeypatch.setattr(campaign_mod, "_load_bars", load)
+    events = _run(dict(TINY, timeframes=["H1", "H4"]), vault, cache)
+    assert events[-1]["status"] == "done"
+    gens = [e for e in events if e["type"] == "generation"]
+    assert gens and {g["timeframe"] for g in gens} == {"H1"}
+    assert any("EURUSD H4: skipped" in line for line in _logs(events))
+
+
+def test_unknown_symbol_skips_market(vault, cache, monkeypatch):
+    real = campaign_mod._load_bars
+
+    def load(cfg, symbol, timeframe, cache, emit):
+        if symbol == "NOPE":
+            raise RuntimeError("MT5 returned no NOPE H1 bars")
+        return real(cfg, symbol, timeframe, cache, emit)
+
+    monkeypatch.setattr(campaign_mod, "_load_bars", load)
+    events = _run(dict(TINY, symbols=["EURUSD", "NOPE"]), vault, cache)
+    assert events[-1]["status"] == "done"
+    assert any(e["symbol"] == "EURUSD" for e in events if e["type"] == "generation")
+    assert any("NOPE: skipped" in line for line in _logs(events))
+
+
+def _seed_strategy(vault):
+    g = random_genome("trend", np.random.default_rng(0))
+    m = {"net_profit": 0.2, "max_drawdown": 0.1, "profit_factor": 1.5,
+         "sharpe": 1.0, "win_rate": 0.6, "trades": 40, "avg_yearly_return": 0.2}
+    sid = vault.add_strategy(
+        name=None, tribe="trend", symbol="EURUSD", timeframe="H1",
+        genome_json=g.to_json(), is_metrics=m, oos_metrics=m,
+        equity=np.linspace(1, 1.2, 30), campaign_id=None,
+    )
+    return sid, g
+
+
+def test_optimise_seeds_population(vault, cache, monkeypatch):
+    sid, g = _seed_strategy(vault)
+    spy = []
+    _force_finalists(monkeypatch, spy=spy)
+    _run(dict(TINY, tribes=["trend"], seed_strategy_id=sid), vault, cache)
+    initial = spy[0][1]["initial"]
+    assert initial is not None
+    assert g.to_json() in [x.to_json() for x in initial]
+
+
+def test_optimise_results_flagged_reused(vault, cache, monkeypatch):
+    sid, _ = _seed_strategy(vault)
+    _force_finalists(monkeypatch)
+    _fake_judge(monkeypatch)
+    events = _run(dict(TINY, tribes=["trend"], seed_strategy_id=sid), vault, cache)
+    assert events[-1]["status"] == "done"
+    rows = [r for r in vault.list_strategies(limit=500) if r["id"] != sid]
+    assert rows
+    assert all(r["holdout_reused"] == 1 for r in rows)
+    assert any("holdout reused" in line for line in _logs(events))
+
+
+def test_second_campaign_on_same_window_flagged_reused(vault, cache, monkeypatch):
+    _force_finalists(monkeypatch)
+    _fake_judge(monkeypatch)
+    first = _run(TINY, vault, cache)
+    windows = json.loads(vault.get_campaign(first[0]["campaign_id"])["holdout_windows_json"])
+    assert [(w["symbol"], w["timeframe"]) for w in windows] == [("EURUSD", "H1")]
+    first_rows = vault.list_strategies(limit=500)
+    assert first_rows and all(r["holdout_reused"] == 0 for r in first_rows)
+    assert not any("holdout reused" in line for line in _logs(first))
+
+    second = _run(TINY, vault, cache)
+    first_ids = {r["id"] for r in first_rows}
+    new = [r for r in vault.list_strategies(limit=500) if r["id"] not in first_ids]
+    assert new and all(r["holdout_reused"] == 1 for r in new)
+    assert any("holdout reused" in line for line in _logs(second))
+
+
+def test_checkpoint_carries_finalists_and_holdout_done(vault, cache, monkeypatch):
+    _force_finalists(monkeypatch)
+    _fake_judge(monkeypatch)
+    events = _run(dict(TINY, symbols=["EURUSD", "GBPUSD"]), vault, cache)
+    ckpt = json.loads(vault.get_campaign(events[0]["campaign_id"])["progress_json"])
+    assert ckpt["holdout_done"] == ["EURUSD", "GBPUSD"]
+    assert set(ckpt["finalists"]) == {"EURUSD", "GBPUSD"}
+    for items in ckpt["finalists"].values():
+        assert items
+        for d in items:
+            assert Finalist.from_json(d).timeframe == "H1"

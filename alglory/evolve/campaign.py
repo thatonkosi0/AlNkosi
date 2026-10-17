@@ -10,19 +10,26 @@ from __future__ import annotations
 import json
 import time
 import traceback
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from alglory.backtest.engine import Costs, effective_spread
+from alglory.backtest.engine import Costs, effective_spread, run_backtest
 from alglory.validation import validate_symbol
-from alglory.data.cache import BarCache, check_sufficiency
+from alglory.data.cache import BarCache, InsufficientDataError, check_sufficiency
 from alglory.data.sample import generate_bars
 from alglory.evolve.costs import commission_price, resolve_profile
-from alglory.evolve.fitness import FitnessConfig, OOSGate
+from alglory.evolve.fitness import FitnessConfig, HoldoutGate, OOSGate
 from alglory.evolve.ga import GAParams, evolve_tribe
+from alglory.evolve.holdout import (
+    Finalist,
+    HoldoutResult,
+    _naive_iso,
+    judge_finalist,
+    keep_best,
+)
 from alglory.evolve.split import split_bars
 from alglory.deploy.mql5 import GUARDRAIL_PRESETS
 from alglory.genome import TRIBES, Genome, mutate
@@ -34,6 +41,19 @@ HISTORY_BARS = 50_000
 EQUITY_POINTS = 200
 TOP_CURVES = 5
 BARS_PER_YEAR = {"M15": 24960.0, "H1": 6240.0, "H4": 1560.0, "D1": 260.0}
+
+
+class BrokerUnavailableError(RuntimeError):
+    """The broker connection itself failed: no market can be loaded."""
+
+
+class _TfData(NamedTuple):
+    """One timeframe of the current market, kept until its holdout stage."""
+
+    bars: pd.DataFrame
+    select: pd.DataFrame
+    holdout: pd.DataFrame
+    costs: Costs
 
 
 class CampaignConfig(BaseModel):
@@ -129,7 +149,7 @@ def _load_bars(
     src = MT5Source()
     status = src.connect()
     if not status.ok:
-        raise RuntimeError(status.message)
+        raise BrokerUnavailableError(status.message)
     emit({"type": "log", "line": f"downloading {symbol} {timeframe} history from MT5 ({status.account})"})
     count = HISTORY_BARS
     while True:
@@ -205,6 +225,130 @@ def _resume_state(
     return sym_start, tf_start, tribe_start, start_gen, population
 
 
+def _window(symbol: str, timeframe: str, holdout: pd.DataFrame) -> dict:
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "start": _naive_iso(holdout["time"].iloc[0]),
+        "end": _naive_iso(holdout["time"].iloc[-1]),
+    }
+
+
+def _overlaps(a: dict, b: dict) -> bool:
+    return pd.Timestamp(a["start"]) <= pd.Timestamp(b["end"]) and pd.Timestamp(
+        b["start"]
+    ) <= pd.Timestamp(a["end"])
+
+
+def _holdout_stage(
+    cfg: CampaignConfig,
+    vault: Vault,
+    emit: Callable[[dict], None],
+    campaign_id: int,
+    symbol: str,
+    finalists: list[Finalist],
+    tf_data: dict[str, _TfData],
+    campaign_windows: list[dict],
+) -> int:
+    """Judge every finalist of one market once on its holdout; vault the best.
+
+    Runs only after all of the market's breeding is finished, so no holdout
+    result can influence which genomes were bred or selected. Returns the
+    number of strategies vaulted.
+    """
+    if not finalists:
+        emit({"type": "log", "line": f"{symbol}: no finalists reached the holdout"})
+        return 0
+    gate = HoldoutGate(min_trades=cfg.min_holdout_trades)
+    preset = None if cfg.target_preset == "personal" else GUARDRAIL_PRESETS[cfg.target_preset]
+
+    # Record the windows as consumed before anything is judged on them.
+    reused: dict[str, bool] = {}
+    judged_tfs = [tf for tf in cfg.timeframes if any(f.timeframe == tf for f in finalists)]
+    for tf in judged_tfs:
+        w = _window(symbol, tf, tf_data[tf].holdout)
+        prior = vault.consumed_holdout_windows(symbol, tf, exclude_campaign=campaign_id)
+        reused[tf] = cfg.seed_strategy_id is not None or any(_overlaps(w, p) for p in prior)
+        campaign_windows.append(w)
+    vault.set_holdout_windows(campaign_id, campaign_windows)
+
+    results: list[HoldoutResult] = []
+    for f in finalists:
+        d = tf_data[f.timeframe]
+        r = judge_finalist(f, d.holdout, d.costs, gate, preset, BARS_PER_YEAR[f.timeframe])
+        results.append(r)
+        head = f"{symbol} {f.timeframe} {f.tribe}"
+        line = (
+            f"{head}: holdout pass"
+            if r.passed
+            else f"{head}: holdout fail — {'; '.join(r.reasons)}"
+        )
+        emit({"type": "log", "line": line})
+    if any(reused.values()):
+        emit({"type": "log", "line": f"{symbol}: holdout reused — results are weaker evidence"})
+
+    kept = keep_best(results, cfg.keep_per_market)
+    n_pass = sum(r.passed for r in results)
+    emit(
+        {
+            "type": "log",
+            "line": f"{symbol}: {n_pass} of {len(results)} finalists passed the holdout; "
+            f"keeping {len(kept)}",
+        }
+    )
+    vaulted = 0
+    for r in kept:
+        f = r.finalist
+        d = tf_data[f.timeframe]
+        sel_equity = run_backtest(f.genome, d.select, d.costs).equity
+        sid = vault.add_strategy(
+            name=None,
+            tribe=f.tribe,
+            symbol=symbol,
+            timeframe=f.timeframe,
+            genome_json=f.genome.to_json(),
+            is_metrics=f.is_metrics.to_dict(),
+            oos_metrics=f.select_metrics.to_dict(),
+            equity=sel_equity,
+            campaign_id=campaign_id,
+            stage="holdout_passed",
+            holdout_metrics=r.metrics.to_dict(),
+            holdout_trades=r.records,
+            holdout_reused=reused[f.timeframe],
+        )
+        # Walk-forward robustness on the full series, as a descriptive label
+        # only: it never feeds keep_best or any selection. Best-effort.
+        grade = None
+        try:
+            from alglory.analysis.robustness import robustness
+
+            rob = robustness(
+                f.genome, d.bars, d.costs, BARS_PER_YEAR[f.timeframe], timeframe=f.timeframe
+            )
+            vault.set_robustness(sid, rob["grade"], rob["score"])
+            grade = rob["grade"]
+        except Exception as exc:  # noqa: BLE001 - scoring must not abort a campaign
+            emit({"type": "log", "line": f"robustness scoring failed for strategy {sid}: {exc}"})
+        vaulted += 1
+        row = vault.get_strategy(sid)
+        emit(
+            {
+                "type": "strategy_vaulted",
+                "strategy_id": sid,
+                "name": row["name"],
+                "tribe": f.tribe,
+                "symbol": symbol,
+                "timeframe": f.timeframe,
+                "oos_net_profit": f.select_metrics.net_profit,
+                "holdout_win_rate": r.metrics.win_rate,
+                "holdout_profit_factor": r.metrics.profit_factor,
+                "holdout_reused": reused[f.timeframe],
+                "robustness_grade": grade,
+            }
+        )
+    return vaulted
+
+
 def run_campaign(
     cfg: CampaignConfig,
     vault: Vault,
@@ -217,6 +361,10 @@ def run_campaign(
     sym_start = tf_start = tribe_start = resume_gen = 0
     resume_pop: list[Genome] | None = None
     resuming = resume_campaign_id is not None
+    position: dict = {}
+    finalists_ckpt: dict[str, list[dict]] = {}
+    holdout_done: list[str] = []
+    campaign_windows: list[dict] = []
     if resuming:
         row = vault.get_campaign(resume_campaign_id)
         if row is None or not row["progress_json"]:
@@ -227,14 +375,33 @@ def run_campaign(
         sym_start, tf_start, tribe_start, resume_gen, resume_pop = _resume_state(cfg, ckpt)
         vaulted_total = int(ckpt.get("vaulted_total", 0))
         units_done = int(ckpt.get("units_done", 0))
+        position = {k: ckpt.get(k) for k in ("symbol", "timeframe", "tribe", "gen", "population")}
+        finalists_ckpt = dict(ckpt.get("finalists") or {})
+        holdout_done = list(ckpt.get("holdout_done") or [])
+        campaign_windows = json.loads(row.get("holdout_windows_json") or "[]")
     else:
         campaign_id = vault.create_campaign(cfg.model_dump_json())
         vaulted_total = 0
         units_done = 0
 
-    total_units = (
-        len(cfg.symbols) * len(cfg.timeframes) * len(cfg.tribes) * cfg.generations
-    )
+    units_per_tf = len(cfg.tribes) * cfg.generations
+    total_units = len(cfg.symbols) * len(cfg.timeframes) * units_per_tf
+
+    def persist() -> None:
+        vault.update_campaign(
+            campaign_id,
+            progress_json=json.dumps(
+                {
+                    "units_done": units_done,
+                    "total_units": total_units,
+                    "vaulted_total": vaulted_total,
+                    **position,
+                    "finalists": finalists_ckpt,
+                    "holdout_done": holdout_done,
+                }
+            ),
+        )
+
     emit(
         {
             "type": "campaign_started",
@@ -281,16 +448,46 @@ def run_campaign(
             )
 
         for s_idx, symbol in enumerate(cfg.symbols):
-            if s_idx < sym_start:
+            if s_idx < sym_start or symbol in holdout_done:
                 continue
+            resumed_market = resuming and s_idx == sym_start
+            # finalists keyed by genome|timeframe; holdout data kept per
+            # timeframe in memory until this market's holdout stage
+            market: dict[str, Finalist] = {}
+            if resumed_market:
+                for d in finalists_ckpt.get(symbol, []):
+                    f = Finalist.from_json(d)
+                    market.setdefault(f.key, f)
+            finalists_ckpt[symbol] = [f.to_json() for f in market.values()]
+            tf_data: dict[str, _TfData] = {}
+
             for tf_idx, timeframe in enumerate(cfg.timeframes):
-                if s_idx == sym_start and tf_idx < tf_start:
+                # earlier timeframes of a resumed market are loaded (their
+                # finalists need the holdout slice) but not bred again
+                already_bred = resumed_market and tf_idx < tf_start
+                try:
+                    bars, costs = _load_bars(cfg, symbol, timeframe, cache, emit)
+                    check_sufficiency(bars, MIN_BARS)
+                except InsufficientDataError as exc:
+                    emit({"type": "log", "line": f"{symbol} {timeframe}: skipped — {exc}"})
+                    if not already_bred:
+                        units_done += units_per_tf
                     continue
-                bars, costs = _load_bars(cfg, symbol, timeframe, cache, emit)
-                check_sufficiency(bars, MIN_BARS)
+                except BrokerUnavailableError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - one bad market must not end the campaign
+                    emit(
+                        {
+                            "type": "log",
+                            "line": f"{symbol}: skipped — not available from broker ({exc})",
+                        }
+                    )
+                    units_done += (len(cfg.timeframes) - tf_idx) * units_per_tf
+                    break
                 bars_breed, bars_select, bars_holdout = split_bars(
                     bars, cfg.select_fraction, cfg.holdout_fraction
                 )
+                tf_data[timeframe] = _TfData(bars, bars_select, bars_holdout, costs)
                 emit(
                     {
                         "type": "log",
@@ -298,15 +495,19 @@ def run_campaign(
                         f"{len(bars_select)} select / {len(bars_holdout)} holdout",
                     }
                 )
+                if already_bred:
+                    continue
 
                 for t_idx, tribe in enumerate(cfg.tribes):
-                    if s_idx == sym_start and tf_idx == tf_start and t_idx < tribe_start:
+                    if resumed_market and tf_idx == tf_start and t_idx < tribe_start:
                         continue
-                    is_resumed_tribe = resuming and s_idx == sym_start and tf_idx == tf_start and t_idx == tribe_start
+                    is_resumed_tribe = (
+                        resumed_market and tf_idx == tf_start and t_idx == tribe_start
+                    )
                     _wait_while_paused(should_pause, should_stop, emit)
                     if should_stop():
                         raise _Cancelled()
-                    emit({"type": "log", "line": f"breeding tribe '{tribe}' on {symbol}"})
+                    emit({"type": "log", "line": f"breeding tribe '{tribe}' on {symbol} {timeframe}"})
                     seed = (cfg.seed if cfg.seed is not None else int(time.time())) + t_idx * 1000
                     initial = None
                     if is_resumed_tribe:
@@ -325,58 +526,20 @@ def run_campaign(
                         gate,
                         seed=seed,
                         bars_per_year=BARS_PER_YEAR[timeframe],
-                        initial=resume_pop if is_resumed_tribe else None,
+                        initial=initial,
                         start_gen=resume_gen if is_resumed_tribe else 0,
-                        already_vaulted=(
-                            vault.campaign_tribe_genomes(campaign_id, symbol, tribe)
-                            if is_resumed_tribe
-                            else None
-                        ),
+                        already_vaulted={
+                            f.genome.to_json()
+                            for f in market.values()
+                            if f.timeframe == timeframe
+                        },
                     ):
-                        for genome, is_m, oos_m in result.vaulted:
-                            from alglory.backtest.engine import run_backtest
-
-                            oos_equity = run_backtest(genome, bars_select, costs).equity
-                            sid = vault.add_strategy(
-                                name=None,
-                                tribe=tribe,
-                                symbol=symbol,
-                                timeframe=timeframe,
-                                genome_json=genome.to_json(),
-                                is_metrics=is_m.to_dict(),
-                                oos_metrics=oos_m.to_dict(),
-                                equity=oos_equity,
-                                campaign_id=campaign_id,
-                            )
-                            # score walk-forward robustness at insert so the vault
-                            # ranks new strategies without a manual rescore. Scored
-                            # on the full series; best-effort — never break vaulting.
-                            grade = None
-                            try:
-                                from alglory.analysis.robustness import robustness
-
-                                r = robustness(
-                                    genome, bars, costs,
-                                    BARS_PER_YEAR[timeframe], timeframe=timeframe,
-                                )
-                                vault.set_robustness(sid, r["grade"], r["score"])
-                                grade = r["grade"]
-                            except Exception as exc:  # noqa: BLE001 - scoring must not abort a campaign
-                                emit({"type": "log", "line": f"robustness scoring failed for strategy {sid}: {exc}"})
-                            vaulted_total += 1
-                            row = vault.get_strategy(sid)
-                            emit(
-                                {
-                                    "type": "strategy_vaulted",
-                                    "strategy_id": sid,
-                                    "name": row["name"],
-                                    "tribe": tribe,
-                                    "symbol": symbol,
-                                    "timeframe": timeframe,
-                                    "oos_net_profit": oos_m.net_profit,
-                                    "robustness_grade": grade,
-                                }
-                            )
+                        # select-gate passers become finalists; nothing is
+                        # vaulted (or judged on the holdout) until the market ends
+                        for genome, is_m, sel_m in result.vaulted:
+                            f = Finalist(genome, tribe, timeframe, is_m, sel_m)
+                            market.setdefault(f.key, f)
+                        finalists_ckpt[symbol] = [f.to_json() for f in market.values()]
 
                         order = sorted(
                             range(len(result.evaluated)),
@@ -388,8 +551,6 @@ def run_campaign(
                             ev = result.evaluated[i]
                             if ev.fit <= 0:
                                 continue
-                            from alglory.backtest.engine import run_backtest
-
                             eq = run_backtest(ev.genome, bars_breed, costs).equity
                             top_equity.append(
                                 {"id": f"G{result.gen}-{i}", "points": _downsample(eq)}
@@ -411,34 +572,35 @@ def run_campaign(
                                 "population": len(result.evaluated),
                                 "top_equity": top_equity,
                                 "vaulted_count_total": vaulted_total,
+                                "finalists": len(market),
                                 "units_done": units_done,
                                 "total_units": total_units,
                             }
                         )
-                        vault.update_campaign(
-                            campaign_id,
-                            progress_json=json.dumps(
-                                {
-                                    "units_done": units_done,
-                                    "total_units": total_units,
-                                    "vaulted_total": vaulted_total,
-                                    "symbol": symbol,
-                                    "timeframe": timeframe,
-                                    "tribe": tribe,
-                                    "gen": result.gen + 1,
-                                    # next generation's population, so a failed or
-                                    # cancelled campaign can resume mid-tribe
-                                    "population": (
-                                        [g.to_json() for g in result.next_population]
-                                        if result.next_population
-                                        else None
-                                    ),
-                                }
+                        position = {
+                            "symbol": symbol,
+                            "timeframe": timeframe,
+                            "tribe": tribe,
+                            "gen": result.gen + 1,
+                            # next generation's population, so a failed or
+                            # cancelled campaign can resume mid-tribe
+                            "population": (
+                                [g.to_json() for g in result.next_population]
+                                if result.next_population
+                                else None
                             ),
-                        )
+                        }
+                        persist()
                         _wait_while_paused(should_pause, should_stop, emit)
                         if should_stop():
                             raise _Cancelled()
+
+            vaulted_total += _holdout_stage(
+                cfg, vault, emit, campaign_id, symbol,
+                list(market.values()), tf_data, campaign_windows,
+            )
+            holdout_done.append(symbol)
+            persist()
     except _Cancelled:
         status, error = "cancelled", None
         emit({"type": "log", "line": "campaign cancelled by user"})
