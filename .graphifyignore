@@ -1,0 +1,6 @@
+﻿# Agent tooling config, not project knowledge
+.claude/
+.claude-flow/
+CLAUDE.md
+graphify-out/
+.mcp.json
