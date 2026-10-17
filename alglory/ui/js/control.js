@@ -15,7 +15,9 @@ function clearOptimize() {
 function prefillOptimize(row) {
   const form = document.getElementById("campaign-form");
   form.elements["symbols"].value = row.symbol;
-  form.elements["timeframe"].value = row.timeframe;
+  form.querySelectorAll('input[name="timeframes"]').forEach((cb) => {
+    cb.checked = cb.value === row.timeframe;
+  });
   form.querySelectorAll('input[name="tribes"]').forEach((cb) => {
     cb.checked = cb.value === row.tribe;
   });
@@ -123,14 +125,22 @@ export function initControl() {
       errorBox.hidden = false;
       return;
     }
+    const timeframes = form.getAll("timeframes");
+    if (timeframes.length === 0) {
+      errorBox.textContent = "Select at least one timeframe.";
+      errorBox.hidden = false;
+      return;
+    }
     const payload = {
       symbols: form.get("symbols").split(",").map((s) => s.trim().toUpperCase()).filter(Boolean),
-      timeframe: form.get("timeframe"),
+      timeframes,
+      target_preset: form.get("target_preset"),
+      keep_per_market: Number(form.get("keep_per_market")),
+      min_holdout_trades: Number(form.get("min_holdout_trades")),
       source: form.get("source"),
       tribes,
       population: Number(form.get("population")),
       generations: Number(form.get("generations")),
-      oos_fraction: Number(form.get("oos_fraction")),
       min_trades: Number(form.get("min_trades")),
       dd_cap: Number(form.get("dd_cap")),
     };

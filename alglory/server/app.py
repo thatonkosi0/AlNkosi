@@ -438,9 +438,13 @@ def create_app(cfg: AppConfig, *, token: str | None = None) -> FastAPI:
         min_oos_sharpe: float | None = None,
         min_oos_trades: float | None = None,
         max_oos_max_drawdown: float | None = None,
+        stage: str | None = None,
+        include_legacy: bool = True,
     ):
         try:
             return vault().list_strategies(
+                stage=stage,
+                include_legacy=include_legacy,
                 symbol=symbol,
                 timeframe=timeframe,
                 tribe=tribe,

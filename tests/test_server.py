@@ -174,6 +174,21 @@ def test_vault_metric_filter_params(app_client):
     assert len(client.get("/api/vault?min_oos_profit_factor=1.0").json()) == 2
 
 
+def test_list_strategies_stage_filter_and_legacy_toggle(app_client):
+    client, fake, cfg = app_client
+    legacy = _seed_strategy(cfg)
+    passed = _seed_strategy(cfg)
+    Vault(cfg.db_path).set_stage(passed, "holdout_passed")
+    ids = lambda **p: {r["id"] for r in client.get("/api/vault", params=p).json()}
+    assert ids() == {legacy, passed}
+    assert ids(include_legacy="false") == {passed}
+    assert ids(stage="legacy") == {legacy}
+    assert ids(stage="holdout_passed") == {passed}
+    assert ids(stage="on_demo") == set()
+    row = client.get("/api/vault", params={"stage": "holdout_passed"}).json()[0]
+    assert row["stage"] == "holdout_passed"
+
+
 def test_campaign_get_by_id(app_client):
     client, fake, cfg = app_client
     cid = Vault(cfg.db_path).create_campaign('{"symbols": ["EURUSD"]}')

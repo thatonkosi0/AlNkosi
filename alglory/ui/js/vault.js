@@ -6,12 +6,52 @@ const NUM = (x) => (x === null || x === undefined ? "-" : x.toFixed(2));
 
 function cls(x) { return x >= 0 ? "pos" : "neg"; }
 
+const STAGE_LABEL = {
+  legacy: "LEGACY", holdout_passed: "HOLDOUT PASSED", on_demo: "ON DEMO",
+  demo_passed: "DEMO PASSED", demo_failed: "DEMO FAILED",
+};
+const STAGE_CLS = { holdout_passed: "pill-ok", on_demo: "pill-warn", demo_passed: "pill-ok", demo_failed: "neg" };
+
+function stageBadge(stage) {
+  return `<span class="pill ${STAGE_CLS[stage] || ""}">${STAGE_LABEL[stage] || stage}</span>`;
+}
+
 function robustCell(r) {
   const g = r.robustness_grade;
   if (!g) return `<span title="not scored yet — click RESCORE">-</span>`;
   const color = g === "A" || g === "B" ? "pos" : g === "D" || g === "F" ? "neg" : "";
   const score = r.robustness_score == null ? "" : ` ${r.robustness_score.toFixed(2)}`;
   return `<span class="${color}" title="walk-forward robustness score">${g}${score}</span>`;
+}
+
+function holdoutCells(r) {
+  if (r.stage === "legacy" || r.ho_trades == null) {
+    return `<td colspan="3" class="neg" title="never tested on an untouched holdout">legacy — no holdout</td>`;
+  }
+  return `<td>${PCT(r.ho_win_rate)}</td><td>${NUM(r.ho_profit_factor)}</td><td>${r.ho_trades}</td>`;
+}
+
+async function refreshDemo() {
+  const out = document.getElementById("demo-panel");
+  out.hidden = false;
+  out.textContent = "Refreshing demo results from MT5…";
+  try {
+    const res = await api("/api/demo/refresh", { method: "POST" });
+    const a = res.account;
+    let text = `ACCOUNT  worst day ${PCT(a.worst_day_loss)}  max drawdown ${PCT(a.max_drawdown)}  ` +
+      (a.breaches.length ? `BREACHES: ${a.breaches.join("; ")}` : "no breaches");
+    if (!res.strategies.length) text += "
+(no strategies are on demo)";
+    for (const s of res.strategies) {
+      text += `
+${s.name}  ${STAGE_LABEL[s.stage] || s.stage}  trades ${s.trades}  ` +
+        `win ${PCT(s.win_rate)}  net ${s.net.toFixed(2)}  ${s.note || ""}${s.legacy ? "  (legacy)" : ""}`;
+    }
+    out.textContent = text;
+    refreshVault().catch((e) => toast(e.message));
+  } catch (err) {
+    out.textContent = `DEMO REFRESH FAILED: ${err.message}`;
+  }
 }
 
 export async function refreshVault() {
@@ -22,6 +62,11 @@ export async function refreshVault() {
   if (symbol) params.set("symbol", symbol.toUpperCase());
   if (tribe) params.set("tribe", tribe);
   params.set("sort", sort);
+  const stage = document.getElementById("vf-stage").value;
+  if (stage) params.set("stage", stage);
+  // Picking the LEGACY stage explicitly must not be hidden by the toggle.
+  const showLegacy = document.getElementById("vf-legacy").checked || stage === "legacy";
+  params.set("include_legacy", showLegacy);
   const minProfit = document.getElementById("vf-minprofit").value;
   const minPf = document.getElementById("vf-minpf").value;
   const maxDd = document.getElementById("vf-maxdd").value;
@@ -35,7 +80,8 @@ export async function refreshVault() {
   for (const r of rows) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>${r.name}</td><td>${r.tribe}</td><td>${r.symbol}</td><td>${r.timeframe}</td>
+      <td>${r.name}</td><td>${stageBadge(r.stage)}</td>${holdoutCells(r)}
+      <td>${r.tribe}</td><td>${r.symbol}</td><td>${r.timeframe}</td>
       <td class="${cls(r.oos_net_profit)}">${PCT(r.oos_net_profit)}</td>
       <td>${NUM(r.oos_profit_factor)}</td>
       <td>${PCT(r.oos_max_drawdown)}</td>
@@ -108,6 +154,7 @@ async function showDetail(sid) {
   body.innerHTML = `
     <h3 style="color:var(--primary);letter-spacing:2px">${row.name} — ${row.symbol} ${row.timeframe}</h3>
     ${geneTags(genome)}
+    <p>${stageBadge(row.stage)}${row.demo ? ` demo: ${row.demo.trades} trades, win ${PCT(row.demo.win_rate)}, net ${row.demo.net.toFixed(2)} ${row.demo.note || ""}` : ""}</p>
     <div class="metric-cols">
       <div><h4>IN-SAMPLE</h4>${metricsTable(row.is_metrics)}</div>
       <div><h4>OUT-OF-SAMPLE (forward test)</h4>${metricsTable(row.oos_metrics)}</div>
@@ -175,6 +222,7 @@ async function deployFlow(sid) {
 export function initVault() {
   document.getElementById("vf-apply").addEventListener("click", () =>
     refreshVault().catch((e) => toast(e.message)));
+  document.getElementById("vf-demo").addEventListener("click", refreshDemo);
   document.getElementById("detail-close").addEventListener("click", () => {
     document.getElementById("vault-detail").hidden = true;
   });

@@ -65,10 +65,17 @@
         <button type="button" id="optimize-clear" class="pill">✕ normal campaign</button>
       </div>
       <form id="campaign-form" class="control-form">
-        <label>SYMBOLS <input type="text" name="symbols" value="EURUSD" title="comma-separated"></label>
-        <label>TIMEFRAME
-          <select name="timeframe">
-            <option>M15</option><option selected>H1</option><option>H4</option><option>D1</option>
+        <label>SYMBOLS <input type="text" name="symbols" value="EURUSD,GBPUSD,USDJPY,USDCHF,AUDUSD,USDCAD,NZDUSD,XAUUSD,USTEC" title="comma-separated (USTEC = Nasdaq on MetaQuotes-Demo)"></label>
+        <fieldset class="tribes-fs"><legend>TIMEFRAMES</legend>
+          <label><input type="checkbox" name="timeframes" value="M15" checked> M15</label>
+          <label><input type="checkbox" name="timeframes" value="H1" checked> H1</label>
+          <label><input type="checkbox" name="timeframes" value="H4" checked> H4</label>
+        </fieldset>
+        <label>TARGET PRESET
+          <select name="target_preset">
+            <option value="personal" selected>PERSONAL</option>
+            <option value="prop_conservative">PROP CONSERVATIVE</option>
+            <option value="prop_aggressive">PROP AGGRESSIVE</option>
           </select>
         </label>
         <label>DATA SOURCE
@@ -91,10 +98,8 @@
           <input type="range" name="generations" min="2" max="60" value="15"
                  oninput="document.getElementById('gen-val').textContent=this.value">
         </label>
-        <label>OOS FRACTION <span class="range-val" id="oos-val">0.25</span>
-          <input type="range" name="oos_fraction" min="0.1" max="0.5" step="0.05" value="0.25"
-                 oninput="document.getElementById('oos-val').textContent=this.value">
-        </label>
+        <label>KEEP PER MARKET <input type="number" name="keep_per_market" value="3" min="1" title="finalists kept per symbol/timeframe"></label>
+        <label>MIN HOLDOUT TRADES <input type="number" name="min_holdout_trades" value="50" min="1"></label>
         <label>MIN TRADES <input type="number" name="min_trades" value="30" min="1"></label>
         <label>DD CAP <input type="number" name="dd_cap" value="0.35" min="0.05" max="1" step="0.05"></label>
         <label>SEED (blank = random) <input type="number" name="seed" placeholder="random"></label>
@@ -137,16 +142,28 @@
         <input type="number" id="vf-minprofit" placeholder="MIN PROFIT %" step="1" title="minimum OOS net profit, percent">
         <input type="number" id="vf-minpf" placeholder="MIN PF" step="0.1" min="0" title="minimum OOS profit factor">
         <input type="number" id="vf-maxdd" placeholder="MAX DD %" step="1" min="0" title="maximum OOS drawdown, percent">
+        <select id="vf-stage">
+          <option value="">ALL STAGES</option>
+          <option value="holdout_passed">HOLDOUT PASSED</option>
+          <option value="on_demo">ON DEMO</option>
+          <option value="demo_passed">DEMO PASSED</option>
+          <option value="demo_failed">DEMO FAILED</option>
+          <option value="legacy">LEGACY</option>
+        </select>
+        <label class="pill" title="legacy strategies were never tested on a holdout"><input type="checkbox" id="vf-legacy"> SHOW LEGACY</label>
         <button id="vf-apply" class="pill">FILTER</button>
+        <button id="vf-demo" class="pill" title="pull demo-account results from MT5 and update stages">REFRESH DEMO RESULTS</button>
         <button id="vf-rescore" class="pill" title="recompute walk-forward robustness for a symbol/timeframe">RESCORE ★</button>
       </div>
       <table class="vault-table" id="vault-table">
         <thead><tr>
-          <th>NAME</th><th>TRIBE</th><th>SYMBOL</th><th>TF</th>
+          <th>NAME</th><th>STAGE</th><th>HOLDOUT WIN%</th><th>HOLDOUT PF</th><th>HOLDOUT TRADES</th>
+          <th>TRIBE</th><th>SYMBOL</th><th>TF</th>
           <th>OOS PROFIT</th><th>PF</th><th>DD</th><th>SHARPE</th><th>TRADES</th><th>ROBUST</th>
         </tr></thead>
         <tbody></tbody>
       </table>
+      <div id="demo-panel" class="terminal" style="height:auto;min-height:40px;margin-bottom:10px" hidden></div>
       <div id="vault-empty" class="empty-note" hidden>VAULT EMPTY - RUN A CAMPAIGN FROM THE CONTROL TAB.</div>
     </div>
     <div class="panel" id="vault-detail" hidden>
