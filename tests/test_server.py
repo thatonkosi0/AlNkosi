@@ -516,3 +516,192 @@ def test_deploy_uses_strategy_magic(app_client):
     body = client.post(f"/api/deploy/{sid}", json={"preset": "personal"}).json()
     code = Path(body["path"]).read_text(encoding="utf-8")
     assert f"InpMagic = {990000 + sid};" in code
+
+
+# ---- demo-stage API (arm rules, precheck, refresh) -------------------------
+
+import pandas as pd
+from datetime import UTC, datetime, timedelta
+
+from alglory.data.mt5source import AccountInfo, ConnStatus
+
+
+def _seed_staged(cfg, stage="holdout_passed", records=None):
+    vault = Vault(cfg.db_path)
+    g = random_genome("trend", np.random.default_rng(0))
+    metrics = {"net_profit": 0.3, "max_drawdown": 0.1, "profit_factor": 1.5,
+               "sharpe": 1.0, "win_rate": 0.5, "trades": 40, "avg_yearly_return": 0.3}
+    return vault.add_strategy(
+        name=None, tribe="trend", symbol="EURUSD", timeframe="H1",
+        genome_json=g.to_json(), is_metrics=metrics, oos_metrics=metrics,
+        equity=np.linspace(1, 1.3, 30), campaign_id=None, stage=stage,
+        holdout_metrics={"net_profit": 0.1, "trades": 5} if records is not None else None,
+        holdout_trades=records,
+    )
+
+
+def _losing_records(day="2026-01-05", n=4):
+    return [{"exit_time": f"{day}T{9 + i:02d}:00:00", "r": -1.0} for i in range(n)]
+
+
+def test_arm_refuses_demo_failed(app_client):
+    client, _, cfg = app_client
+    fake = _install_fake_executor(client)
+    sid = _seed_staged(cfg, stage="demo_failed", records=_losing_records())
+    r = client.post("/api/executor/arm", json={"strategy_ids": [sid], "mode": "demo"})
+    assert r.status_code == 409
+    assert r.json()["detail"] == f"Strategy {sid} failed its demo; it cannot be re-armed."
+    assert fake.armed is None
+
+
+def test_arm_demo_sets_on_demo_and_start_time(app_client):
+    client, _, cfg = app_client
+    _install_fake_executor(client)
+    sid = _seed_staged(cfg, records=_losing_records())
+    r = client.post("/api/executor/arm",
+                    json={"strategy_ids": [sid], "mode": "demo", "preset": "prop_conservative"})
+    assert r.status_code == 200
+    row = Vault(cfg.db_path).get_strategy(sid)
+    assert row["stage"] == "on_demo"
+    assert row["demo_preset"] == "prop_conservative"
+    assert datetime.fromisoformat(row["demo_started_at"]).tzinfo is not None
+    # re-arming keeps the original start time
+    client.post("/api/executor/arm", json={"strategy_ids": [sid], "mode": "demo"})
+    assert Vault(cfg.db_path).get_strategy(sid)["demo_started_at"] == row["demo_started_at"]
+
+
+def test_arm_allows_legacy(app_client):
+    client, _, cfg = app_client
+    fake = _install_fake_executor(client)
+    sid = _seed_strategy(cfg)
+    r = client.post("/api/executor/arm", json={"strategy_ids": [sid], "mode": "dry_run"})
+    assert r.status_code == 200
+    assert fake.armed is not None
+    assert Vault(cfg.db_path).get_strategy(sid)["stage"] == "legacy"
+
+
+def test_precheck_flags_joint_breach_and_excludes_legacy(app_client):
+    client, _, cfg = app_client
+    a = _seed_staged(cfg, records=_losing_records())
+    b = _seed_staged(cfg, records=_losing_records())
+    legacy = _seed_strategy(cfg)
+    # 8 x -1R at 0.5% on one day is ~3.9%, over the 3% daily limit; one alone is ~2%
+    r = client.post("/api/executor/precheck",
+                    json={"strategy_ids": [a, b, legacy], "preset": "prop_conservative"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["worst_day_loss"] > 0.03
+    assert any("daily loss" in x for x in body["breaches"])
+    assert body["excluded"] == [{"id": legacy, "reason": "legacy — no holdout"}]
+    solo = client.post("/api/executor/precheck",
+                       json={"strategy_ids": [a], "preset": "prop_conservative"}).json()
+    assert solo["breaches"] == []
+
+
+def test_precheck_all_excluded_returns_zeros(app_client):
+    client, _, cfg = app_client
+    legacy = _seed_strategy(cfg)
+    r = client.post("/api/executor/precheck", json={"strategy_ids": [legacy], "preset": "personal"})
+    assert r.status_code == 200
+    assert r.json() == {
+        "worst_day_loss": 0.0, "max_drawdown": 0.0, "breaches": [],
+        "excluded": [{"id": legacy, "reason": "legacy — no holdout"}],
+    }
+
+
+class _DealsSource:
+    def __init__(self, deals, balance=10_000.0):
+        self._deals, self._balance = deals, balance
+
+    def connect(self):
+        return ConnStatus(ok=True, message="ok")
+
+    def account(self):
+        return AccountInfo(1, self._balance, self._balance, "USD", True)
+
+    def deals_since(self, start):
+        return self._deals[self._deals["time"] >= start].reset_index(drop=True)
+
+
+class _DownSource:
+    def connect(self):
+        return ConnStatus(ok=False, message="terminal not running")
+
+
+def _deals_for(magic, wins, losses, now):
+    rows = []
+    n = wins + losses
+    for i in range(n):
+        t = now - timedelta(hours=(n - i) * 3)
+        profit = 10.0 if i < wins else -5.0
+        rows.append({"time": t, "magic": magic, "entry": "in", "profit": 0.0,
+                     "commission": 0.0, "swap": 0.0})
+        rows.append({"time": t + timedelta(minutes=30), "magic": magic, "entry": "out",
+                     "profit": profit, "commission": 0.0, "swap": 0.0})
+    return rows
+
+
+def _set_on_demo(cfg, sid, days_ago, preset="personal"):
+    started = (datetime.now(UTC) - timedelta(days=days_ago)).isoformat()
+    Vault(cfg.db_path).set_stage(sid, "on_demo", demo_started_at=started, demo_preset=preset)
+
+
+def test_demo_refresh_promotes_and_keeps_waiting(app_client):
+    client, _, cfg = app_client
+    a = _seed_staged(cfg, records=_losing_records())
+    b = _seed_staged(cfg, records=_losing_records())
+    _set_on_demo(cfg, a, 22)
+    _set_on_demo(cfg, b, 22)
+    now = datetime.now(UTC)
+    rows = _deals_for(990_000 + a, 18, 7, now - timedelta(days=1)) + \
+        _deals_for(990_000 + b, 6, 4, now - timedelta(days=1))
+    deals = pd.DataFrame(rows)
+    client.app.state.demo_source_factory = lambda: _DealsSource(deals)
+
+    r = client.post("/api/demo/refresh")
+    assert r.status_code == 200
+    body = r.json()
+    by_id = {s["id"]: s for s in body["strategies"]}
+    assert by_id[a]["stage"] == "demo_passed"
+    assert by_id[a]["trades"] == 25
+    assert by_id[a]["win_rate"] == pytest.approx(0.72)
+    assert by_id[a]["legacy"] is False
+    assert by_id[b]["stage"] == "on_demo"
+    assert by_id[b]["note"] == "needs more trades"
+    assert set(body["account"]) == {"worst_day_loss", "max_drawdown", "breaches"}
+    row = Vault(cfg.db_path).get_strategy(a)
+    assert row["stage"] == "demo_passed"
+    assert row["demo"]["trades"] == 25
+
+
+def test_demo_refresh_503_when_mt5_down_changes_nothing(app_client):
+    client, _, cfg = app_client
+    a = _seed_staged(cfg, records=_losing_records())
+    _set_on_demo(cfg, a, 30)
+    before = Vault(cfg.db_path).get_strategy(a)
+    client.app.state.demo_source_factory = lambda: _DownSource()
+    r = client.post("/api/demo/refresh")
+    assert r.status_code == 503
+    assert "terminal not running" in r.json()["detail"]
+    after = Vault(cfg.db_path).get_strategy(a)
+    assert after["stage"] == before["stage"] == "on_demo"
+    assert after["demo_json"] == before["demo_json"]
+
+
+def test_demo_refresh_breach_fails_strategy(app_client):
+    client, _, cfg = app_client
+    a = _seed_staged(cfg, records=_losing_records())
+    _set_on_demo(cfg, a, 2, preset="prop_conservative")
+    t = datetime.now(UTC) - timedelta(hours=2)
+    deals = pd.DataFrame([
+        {"time": t, "magic": 990_000 + a, "entry": "in", "profit": 0.0,
+         "commission": 0.0, "swap": 0.0},
+        {"time": t + timedelta(minutes=10), "magic": 990_000 + a, "entry": "out",
+         "profit": -500.0, "commission": 0.0, "swap": 0.0},
+    ])
+    client.app.state.demo_source_factory = lambda: _DealsSource(deals, balance=9_500.0)
+    body = client.post("/api/demo/refresh").json()
+    s = body["strategies"][0]
+    assert s["stage"] == "demo_failed"
+    assert s["note"] == "prop limit breached"
+    assert body["account"]["breaches"]

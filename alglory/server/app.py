@@ -6,6 +6,7 @@ import asyncio
 import json
 import secrets
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -14,6 +15,8 @@ from pydantic import BaseModel
 
 import numpy as np
 
+from alglory.analysis.demo import account_prop, decide_stage, demo_stats
+from alglory.analysis.prop import breaches, combined_prop, stream_from_records
 from alglory.analysis.sizing import (
     DEFAULT_MAX_RISK_PCT,
     EURUSD_STD,
@@ -42,6 +45,16 @@ class DeployRequest(BaseModel):
     preset: str = "personal"
     custom: dict | None = None
     out_dir: str | None = None
+
+
+class PrecheckRequest(BaseModel):
+    strategy_ids: list[int]
+    preset: str = "personal"
+
+
+def _aware(iso: str) -> datetime:
+    dt = datetime.fromisoformat(iso)
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
 class ExecutorArmRequest(BaseModel):
@@ -184,6 +197,7 @@ def create_app(cfg: AppConfig, *, token: str | None = None) -> FastAPI:
     app.state.manager = CampaignManager(cfg.db_path, cfg.data_dir)
     app.state.executor = ExecutorManager()
     app.state.sockets = set()
+    app.state.demo_source_factory = MT5Source
     app.add_middleware(TokenAuthMiddleware, token=app.state.token)
 
     def vault() -> Vault:
@@ -283,6 +297,10 @@ def create_app(cfg: AppConfig, *, token: str | None = None) -> FastAPI:
             row = vault().get_strategy(sid)
             if row is None:
                 raise HTTPException(404, f"Strategy {sid} not found.")
+            if row["stage"] == "demo_failed":
+                raise HTTPException(
+                    409, f"Strategy {sid} failed its demo; it cannot be re-armed."
+                )
             runtimes.append(
                 StrategyRuntime(
                     genome=Genome.from_json(row["genome_json"]),
@@ -304,7 +322,89 @@ def create_app(cfg: AppConfig, *, token: str | None = None) -> FastAPI:
             raise HTTPException(400, str(exc)) from exc
         except RuntimeError as exc:  # MT5 not installed / not connected
             raise HTTPException(503, str(exc)) from exc
+        if mode == "demo":
+            v = vault()
+            now_iso = datetime.now(UTC).isoformat()
+            for sid in req.strategy_ids:
+                started = v.get_strategy(sid)["demo_started_at"]
+                v.set_stage(
+                    sid, "on_demo",
+                    demo_started_at=None if started else now_iso,
+                    demo_preset=req.preset,
+                )
         return app.state.executor.status()
+
+    @app.post("/api/executor/precheck")
+    def executor_precheck(req: PrecheckRequest):
+        if req.preset not in GUARDRAIL_PRESETS:
+            raise HTTPException(
+                422, f"Unknown preset {req.preset!r}; valid: {sorted(GUARDRAIL_PRESETS)}"
+            )
+        guard = GUARDRAIL_PRESETS[req.preset]
+        streams, excluded = [], []
+        for sid in req.strategy_ids:
+            row = vault().get_strategy(sid)
+            if row is None:
+                raise HTTPException(404, f"Strategy {sid} not found.")
+            if not row["holdout_json"] or not row["holdout_trades"]:
+                excluded.append({"id": sid, "reason": "legacy — no holdout"})
+                continue
+            streams.append(stream_from_records(row["holdout_trades"], guard.risk_pct))
+        if not streams:
+            return {"worst_day_loss": 0.0, "max_drawdown": 0.0, "breaches": [],
+                    "excluded": excluded}
+        m = combined_prop(streams)
+        return {"worst_day_loss": m.worst_day_loss, "max_drawdown": m.max_drawdown,
+                "breaches": breaches(m, guard), "excluded": excluded}
+
+    @app.post("/api/demo/refresh")
+    def demo_refresh():
+        v = vault()
+        rows = [v.get_strategy(r["id"]) for r in v.list_strategies(stage="on_demo")]
+        now = datetime.now(UTC)
+        src = app.state.demo_source_factory()
+        status = src.connect()
+        if not status.ok:
+            raise HTTPException(503, status.message)
+        starts = {r["id"]: _aware(r["demo_started_at"]) if r["demo_started_at"] else now
+                  for r in rows}
+        if not rows:
+            return {"strategies": [], "account": {
+                "worst_day_loss": 0.0, "max_drawdown": 0.0, "breaches": []}}
+        deals = src.deals_since(min(starts.values()))
+        acct_metrics, day_loss = account_prop(deals, src.account().balance)
+
+        acct_breaches: list[str] = []
+        out, updates = [], []
+        for r in rows:
+            preset = r["demo_preset"] if r["demo_preset"] in GUARDRAIL_PRESETS else "personal"
+            guard = GUARDRAIL_PRESETS[preset]
+            mine = deals[deals["time"] >= starts[r["id"]]]
+            magic = _EXECUTOR_MAGIC_BASE + r["id"]
+            stats = demo_stats(mine, magic)
+            closed = mine[(mine["magic"] == magic) & (mine["entry"] == "out")]
+            closed_days = set(closed["time"].dt.date) if len(closed) else set()
+            breached = (
+                any(day_loss.get(d, 0.0) > guard.daily_loss_pct for d in closed_days)
+                or acct_metrics.max_drawdown > guard.max_dd_pct
+            )
+            for msg in breaches(acct_metrics, guard):
+                if msg not in acct_breaches:
+                    acct_breaches.append(msg)
+            stage, note = decide_stage(stats, starts[r["id"]], now, breached)
+            updates.append((r["id"], stage, {**stats, "note": note}))
+            out.append({
+                "id": r["id"], "name": r["name"], "stage": stage, "note": note,
+                "legacy": not r["holdout_json"], "trades": stats["trades"],
+                "win_rate": stats["win_rate"], "net": stats["net"],
+            })
+        for sid, stage, dj in updates:
+            v.set_stage(sid, stage, demo_json=dj)
+        return {"strategies": out, "account": {
+            "worst_day_loss": acct_metrics.worst_day_loss,
+            "max_drawdown": acct_metrics.max_drawdown,
+            "breaches": acct_breaches,
+        }}
 
     @app.post("/api/executor/stop")
     def executor_stop():
