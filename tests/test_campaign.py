@@ -582,8 +582,208 @@ def test_checkpoint_carries_finalists_and_holdout_done(vault, cache, monkeypatch
     events = _run(dict(TINY, symbols=["EURUSD", "GBPUSD"]), vault, cache)
     ckpt = json.loads(vault.get_campaign(events[0]["campaign_id"])["progress_json"])
     assert ckpt["holdout_done"] == ["EURUSD", "GBPUSD"]
-    assert set(ckpt["finalists"]) == {"EURUSD", "GBPUSD"}
-    for items in ckpt["finalists"].values():
-        assert items
-        for d in items:
-            assert Finalist.from_json(d).timeframe == "H1"
+    # judged markets are pruned from the checkpoint (Ruling F.3)
+    assert ckpt["finalists"] == {}
+
+
+def test_checkpoint_carries_finalists_mid_market(vault, cache, monkeypatch):
+    _force_finalists(monkeypatch)
+    _fake_judge(monkeypatch)
+    # cancel after EURUSD's first tribe: its finalists must be in the checkpoint
+    events = _run(dict(TINY, symbols=["EURUSD", "GBPUSD"]), vault, cache, stop_after=4)
+    assert events[-1]["status"] == "cancelled"
+    ckpt = json.loads(vault.get_campaign(events[0]["campaign_id"])["progress_json"])
+    assert ckpt["holdout_done"] == []
+    assert set(ckpt["finalists"]) == {"EURUSD"}
+    assert ckpt["finalists"]["EURUSD"]
+    for d in ckpt["finalists"]["EURUSD"]:
+        assert Finalist.from_json(d).timeframe == "H1"
+
+
+def _resume(cfg_kwargs, vault, cache, cid):
+    events = []
+    run_campaign(CampaignConfig(**cfg_kwargs), vault, cache, events.append,
+                 should_stop=lambda: False, resume_campaign_id=cid)
+    return events
+
+
+def _ckpt(vault, cid):
+    return json.loads(vault.get_campaign(cid)["progress_json"])
+
+
+def _assert_judged_once(calls):
+    keys = [f.key for f in calls]
+    assert keys and len(keys) == len(set(keys))
+
+
+def test_cancel_resume_keeps_finalists_and_judges_once(vault, cache, monkeypatch):
+    _force_finalists(monkeypatch)
+    calls = _fake_judge(monkeypatch)
+    cfg = dict(TINY, timeframes=["H1", "H4"])
+    # 2 tribes x (1 pre-tribe + 3 per-gen) should_stop calls = 8 -> cancel after H1
+    first = _run(cfg, vault, cache, stop_after=8)
+    assert first[-1]["status"] == "cancelled"
+    cid = first[0]["campaign_id"]
+    assert not any(e["type"] == "strategy_vaulted" for e in first)
+    assert not _verdicts(first)
+    assert not any("finalists passed the holdout" in line for line in _logs(first))
+    assert not calls
+    ckpt = _ckpt(vault, cid)
+    assert ckpt["timeframe"] == "H1" and ckpt["finalists"]["EURUSD"]
+    h1_keys = {Finalist.from_json(d).key for d in ckpt["finalists"]["EURUSD"]}
+
+    second = _resume(cfg, vault, cache, cid)
+    assert second[-1]["status"] == "done"
+    _assert_judged_once(calls)
+    assert len(_verdicts(second)) == len(calls)
+    judged = {f.key for f in calls}
+    assert h1_keys <= judged  # finalists bred before the cancel are not lost
+    assert {f.timeframe for f in calls} == {"H1", "H4"}
+    ids = [e["strategy_id"] for e in second if e["type"] == "strategy_vaulted"]
+    assert ids and len(ids) == len(set(ids))
+    assert len(ids) <= CampaignConfig(**cfg).keep_per_market
+    assert vault.count() == len(ids)
+
+
+def test_cancel_after_market_last_generation_runs_its_holdout_on_resume(
+    vault, cache, monkeypatch
+):
+    _force_finalists(monkeypatch)
+    calls = _fake_judge(monkeypatch)
+    cfg = dict(TINY, symbols=["EURUSD", "GBPUSD"])
+    # the 8th should_stop call follows EURUSD's last persisted generation
+    first = _run(cfg, vault, cache, stop_after=7)
+    assert first[-1]["status"] == "cancelled"
+    cid = first[0]["campaign_id"]
+    ckpt = _ckpt(vault, cid)
+    assert (ckpt["symbol"], ckpt["tribe"], ckpt["gen"]) == ("EURUSD", "momentum", 3)
+    assert ckpt["holdout_done"] == []
+    eur_keys = {Finalist.from_json(d).key for d in ckpt["finalists"]["EURUSD"]}
+    assert eur_keys and not calls
+
+    second = _resume(cfg, vault, cache, cid)
+    assert second[-1]["status"] == "done"
+    _assert_judged_once(calls)
+    assert eur_keys <= {f.key for f in calls}
+    eur_verdict = next(i for i, e in enumerate(second) if e["type"] == "log"
+                       and e["line"].startswith("EURUSD H1") and "holdout" in e["line"])
+    gbp_gen = next(i for i, e in enumerate(second)
+                   if e["type"] == "generation" and e["symbol"] == "GBPUSD")
+    assert eur_verdict < gbp_gen
+    # EURUSD is not bred again
+    assert not any(e["type"] == "generation" and e["symbol"] == "EURUSD" for e in second)
+    final = _ckpt(vault, cid)
+    assert final["holdout_done"] == ["EURUSD", "GBPUSD"]
+    assert final["units_done"] == final["total_units"]
+
+
+def test_crash_before_holdout_done_runs_holdout_on_resume(vault, cache, monkeypatch):
+    _force_finalists(monkeypatch)
+    calls = _fake_judge(monkeypatch)
+    real_stage = campaign_mod._holdout_stage
+    crashed = {"n": 0}
+
+    def stage(*a, **kw):
+        if not crashed["n"]:
+            crashed["n"] += 1
+            raise RuntimeError("simulated crash before the holdout stage")
+        return real_stage(*a, **kw)
+
+    monkeypatch.setattr(campaign_mod, "_holdout_stage", stage)
+    first = _run(TINY, vault, cache)
+    assert first[-1]["status"] == "failed"
+    cid = first[0]["campaign_id"]
+    assert _ckpt(vault, cid)["holdout_done"] == []
+    assert not calls
+
+    second = _resume(TINY, vault, cache, cid)
+    assert second[-1]["status"] == "done"
+    _assert_judged_once(calls)
+    assert len(_verdicts(second)) == len(calls)
+    assert _ckpt(vault, cid)["holdout_done"] == ["EURUSD"]
+    assert vault.count() >= 1
+
+
+def test_crash_mid_holdout_stage_no_duplicate_windows_or_strategies(
+    vault, cache, monkeypatch
+):
+    _force_finalists(monkeypatch)
+    _fake_judge(monkeypatch)
+    real_add = vault.add_strategy
+    adds = {"n": 0}
+
+    def add(*a, **kw):
+        adds["n"] += 1
+        if adds["n"] == 2:
+            raise RuntimeError("simulated crash while vaulting")
+        return real_add(*a, **kw)
+
+    monkeypatch.setattr(vault, "add_strategy", add)
+    first = _run(TINY, vault, cache)
+    assert first[-1]["status"] == "failed"
+    cid = first[0]["campaign_id"]
+    assert vault.count() == 1
+    windows_before = json.loads(vault.get_campaign(cid)["holdout_windows_json"])
+    assert len(windows_before) == 1
+
+    second = _resume(TINY, vault, cache, cid)
+    assert second[-1]["status"] == "done"
+    windows = json.loads(vault.get_campaign(cid)["holdout_windows_json"])
+    assert windows == windows_before  # no duplicate window on resume (Ruling F.4)
+    rows = vault.list_strategies(limit=500)
+    jsons = [vault.get_strategy(r["id"])["genome_json"] for r in rows]
+    assert len(jsons) == len(set(jsons))  # nothing vaulted twice
+    assert 1 < len(rows) <= 3
+    assert second[-1]["vaulted_total"] == len(rows)
+
+
+def test_resume_when_bred_timeframe_no_longer_loads(vault, cache, monkeypatch):
+    _force_finalists(monkeypatch)
+    calls = _fake_judge(monkeypatch)
+    cfg = dict(TINY, timeframes=["H1", "H4"])
+    first = _run(cfg, vault, cache, stop_after=8)  # cancel after H1
+    cid = first[0]["campaign_id"]
+    assert _ckpt(vault, cid)["finalists"]["EURUSD"]
+
+    real = campaign_mod._load_bars
+
+    def load(cfg_, symbol, timeframe, cache_, emit):
+        if timeframe == "H1":
+            raise InsufficientDataError("Only 10 bars of history available")
+        return real(cfg_, symbol, timeframe, cache_, emit)
+
+    monkeypatch.setattr(campaign_mod, "_load_bars", load)
+    second = _resume(cfg, vault, cache, cid)
+    assert second[-1]["status"] == "done"
+    assert "EURUSD H1: holdout skipped — no data" in _logs(second)
+    assert calls and {f.timeframe for f in calls} == {"H4"}
+    _assert_judged_once(calls)
+    final = _ckpt(vault, cid)
+    assert final["units_done"] == final["total_units"]  # H1 not counted twice
+    gens = [e for e in second if e["type"] == "generation"]
+    assert gens[-1]["units_done"] == final["total_units"]
+
+
+def test_resume_when_market_skips_counts_units_once_and_names_error(
+    vault, cache, monkeypatch
+):
+    _force_finalists(monkeypatch)
+    calls = _fake_judge(monkeypatch)
+    cfg = dict(TINY, timeframes=["H1", "H4"])
+    first = _run(cfg, vault, cache, stop_after=8)  # cancel after H1
+    cid = first[0]["campaign_id"]
+
+    def load(*a, **kw):
+        raise KeyError("boom")  # a programming error, not a broker answer
+
+    monkeypatch.setattr(campaign_mod, "_load_bars", load)
+    second = _resume(cfg, vault, cache, cid)
+    assert second[-1]["status"] == "done"
+    logs = _logs(second)
+    assert any(line.startswith("EURUSD: skipped") and "KeyError" in line for line in logs)
+    assert "EURUSD H1: holdout skipped — no data" in logs
+    assert not calls
+    final = _ckpt(vault, cid)
+    assert final["units_done"] == final["total_units"]
+    assert final["holdout_done"] == ["EURUSD"]
+    assert final["finalists"] == {}

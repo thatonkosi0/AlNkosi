@@ -255,12 +255,31 @@ def _holdout_stage(
     Runs only after all of the market's breeding is finished, so no holdout
     result can influence which genomes were bred or selected. Returns the
     number of strategies vaulted.
+
+    Safe to rerun after a crash inside the stage: windows already recorded
+    are not recorded again and strategies this campaign already vaulted for
+    the market are not vaulted twice.
     """
+    # A resumed market whose already-bred timeframe no longer loads has no
+    # holdout slice for that timeframe's finalists: skip them, loudly.
+    missing = [
+        tf for tf in cfg.timeframes
+        if tf not in tf_data and any(f.timeframe == tf for f in finalists)
+    ]
+    for tf in missing:
+        emit({"type": "log", "line": f"{symbol} {tf}: holdout skipped — no data"})
+    finalists = [f for f in finalists if f.timeframe in tf_data]
     if not finalists:
         emit({"type": "log", "line": f"{symbol}: no finalists reached the holdout"})
         return 0
     gate = HoldoutGate(min_trades=cfg.min_holdout_trades)
     preset = None if cfg.target_preset == "personal" else GUARDRAIL_PRESETS[cfg.target_preset]
+
+    # An earlier run already recorded this market's windows, so it crashed
+    # inside this stage; finish it without duplicating its effects.
+    interrupted = any(w["symbol"] == symbol for w in campaign_windows)
+    if interrupted:
+        emit({"type": "log", "line": f"{symbol}: completing an interrupted holdout stage"})
 
     # Record the windows as consumed before anything is judged on them.
     reused: dict[str, bool] = {}
@@ -269,7 +288,8 @@ def _holdout_stage(
         w = _window(symbol, tf, tf_data[tf].holdout)
         prior = vault.consumed_holdout_windows(symbol, tf, exclude_campaign=campaign_id)
         reused[tf] = cfg.seed_strategy_id is not None or any(_overlaps(w, p) for p in prior)
-        campaign_windows.append(w)
+        if w not in campaign_windows:
+            campaign_windows.append(w)
     vault.set_holdout_windows(campaign_id, campaign_windows)
 
     results: list[HoldoutResult] = []
@@ -299,6 +319,11 @@ def _holdout_stage(
     vaulted = 0
     for r in kept:
         f = r.finalist
+        if interrupted and f.genome.to_json() in vault.campaign_tribe_genomes(
+            campaign_id, symbol, f.tribe
+        ):
+            vaulted += 1  # stored before the crash, never counted
+            continue
         d = tf_data[f.timeframe]
         sel_equity = run_backtest(f.genome, d.select, d.costs).equity
         sid = vault.add_strategy(
@@ -379,6 +404,14 @@ def run_campaign(
         finalists_ckpt = dict(ckpt.get("finalists") or {})
         holdout_done = list(ckpt.get("holdout_done") or [])
         campaign_windows = json.loads(row.get("holdout_windows_json") or "[]")
+        ck_sym = ckpt.get("symbol")
+        if ck_sym in cfg.symbols and ck_sym not in holdout_done:
+            ck_idx = cfg.symbols.index(ck_sym)
+            if sym_start > ck_idx:
+                # the market's breeding finished but its holdout stage never
+                # completed: run it (every timeframe already bred) first
+                sym_start, tf_start, tribe_start = ck_idx, len(cfg.timeframes), 0
+                resume_gen, resume_pop = 0, None
     else:
         campaign_id = vault.create_campaign(cfg.model_dump_json())
         vaulted_total = 0
@@ -461,6 +494,14 @@ def run_campaign(
             finalists_ckpt[symbol] = [f.to_json() for f in market.values()]
             tf_data: dict[str, _TfData] = {}
 
+            def unbred(tf_idx: int) -> int:
+                """Generation units of this timeframe not yet in units_done."""
+                if not resumed_market or tf_idx > tf_start:
+                    return units_per_tf
+                if tf_idx < tf_start:
+                    return 0
+                return units_per_tf - (tribe_start * cfg.generations + resume_gen)
+
             for tf_idx, timeframe in enumerate(cfg.timeframes):
                 # earlier timeframes of a resumed market are loaded (their
                 # finalists need the holdout slice) but not bred again
@@ -470,8 +511,7 @@ def run_campaign(
                     check_sufficiency(bars, MIN_BARS)
                 except InsufficientDataError as exc:
                     emit({"type": "log", "line": f"{symbol} {timeframe}: skipped — {exc}"})
-                    if not already_bred:
-                        units_done += units_per_tf
+                    units_done += unbred(tf_idx)
                     continue
                 except BrokerUnavailableError:
                     raise
@@ -479,10 +519,11 @@ def run_campaign(
                     emit(
                         {
                             "type": "log",
-                            "line": f"{symbol}: skipped — not available from broker ({exc})",
+                            "line": f"{symbol}: skipped — not available from broker "
+                            f"({type(exc).__name__}: {exc})",
                         }
                     )
-                    units_done += (len(cfg.timeframes) - tf_idx) * units_per_tf
+                    units_done += sum(unbred(i) for i in range(tf_idx, len(cfg.timeframes)))
                     break
                 bars_breed, bars_select, bars_holdout = split_bars(
                     bars, cfg.select_fraction, cfg.holdout_fraction
@@ -600,6 +641,7 @@ def run_campaign(
                 list(market.values()), tf_data, campaign_windows,
             )
             holdout_done.append(symbol)
+            finalists_ckpt.pop(symbol, None)  # judged: nothing left to resume
             persist()
     except _Cancelled:
         status, error = "cancelled", None
