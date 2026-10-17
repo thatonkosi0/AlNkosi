@@ -76,3 +76,48 @@ def test_fetch_bars_unknown_timeframe():
     src._connected = True
     with pytest.raises(ValueError, match="timeframe"):
         src.fetch_bars("EURUSD", "M3", 10)
+
+
+def _deals_mt5(raw):
+    calls = []
+    mt5 = types.SimpleNamespace(DEAL_ENTRY_IN=0, DEAL_ENTRY_OUT=1, DEAL_ENTRY_INOUT=2)
+
+    def history_deals_get(date_from, date_to):
+        calls.append((date_from, date_to))
+        return raw
+
+    mt5.history_deals_get = history_deals_get
+    return mt5, calls
+
+
+def test_deals_since_pads_date_to_for_broker_server_time():
+    from datetime import UTC, datetime, timedelta
+
+    deal = lambda t, entry, profit: types.SimpleNamespace(  # noqa: E731
+        time=t, magic=990_001, entry=entry, profit=profit, commission=-0.5, swap=0.0)
+    raw = [deal(1700000000, 0, 0.0), deal(1700003600, 1, 12.5), deal(1700007200, 2, -3.0)]
+    src = MT5Source()
+    src._mt5, calls = _deals_mt5(raw)
+    src._connected = True
+    start = datetime.now(UTC) - timedelta(days=3)
+    before = datetime.now(UTC)
+    df = src.deals_since(start)
+    (date_from, date_to), = calls
+    assert date_from == start
+    # MT5 deal times are broker server time (UTC+2/+3): look a day ahead
+    assert date_to >= before + timedelta(hours=23)
+    assert list(df["entry"]) == ["in", "out", "out"]
+    assert list(df["profit"]) == [0.0, 12.5, -3.0]
+    assert df["time"].iloc[0] == datetime.fromtimestamp(1700000000, UTC)
+
+
+@pytest.mark.parametrize("raw", [None, ()])
+def test_deals_since_empty_result_has_columns(raw):
+    from datetime import UTC, datetime
+
+    src = MT5Source()
+    src._mt5, _ = _deals_mt5(raw)
+    src._connected = True
+    df = src.deals_since(datetime.now(UTC))
+    assert df.empty
+    assert list(df.columns) == ["time", "magic", "entry", "profit", "commission", "swap"]

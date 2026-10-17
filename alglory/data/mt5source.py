@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -279,7 +279,9 @@ class MT5Source:
         """Account deals from ``start`` (UTC) to now: time, magic, entry, profit, commission, swap."""
         self._require_connection()
         cols = ["time", "magic", "entry", "profit", "commission", "swap"]
-        raw = self._mt5.history_deals_get(start, datetime.now(UTC))
+        # Deal timestamps are broker server time (often UTC+2/+3), so a
+        # date_to of "now in UTC" would drop the last hours of deals.
+        raw = self._mt5.history_deals_get(start, datetime.now(UTC) + timedelta(days=1))
         if not raw:
             return pd.DataFrame(columns=cols)
         rows = [
