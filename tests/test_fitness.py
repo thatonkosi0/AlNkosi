@@ -1,10 +1,17 @@
 import pytest
 
 from alglory.backtest.metrics import Metrics
-from alglory.evolve.fitness import FitnessConfig, OOSGate, fitness, oos_pass
+from alglory.evolve.fitness import (
+    FitnessConfig,
+    HoldoutGate,
+    OOSGate,
+    fitness,
+    holdout_pass,
+    oos_pass,
+)
 
 
-def m(net=0.2, dd=0.1, pf=1.8, sharpe=1.2, wr=0.5, trades=60, ayr=0.2):
+def m(net=0.2, dd=0.1, pf=1.8, sharpe=1.2, wr=0.6, trades=60, ayr=0.2):
     return Metrics(
         net_profit=net,
         max_drawdown=dd,
@@ -61,3 +68,32 @@ def test_oos_pass_truth_table():
     assert oos_pass(m(net=0.1, pf=1.05, dd=0.1, trades=20), GATE) is False
     assert oos_pass(m(net=0.1, pf=1.5, dd=0.5, trades=20), GATE) is False
     assert oos_pass(m(net=0.1, pf=1.5, dd=0.1, trades=GATE.min_trades - 1), GATE) is False
+
+
+def test_fitness_rewards_win_rate_when_profitable():
+    assert fitness(m(wr=0.68), CFG) > fitness(m(wr=0.50), CFG)
+
+
+def test_fitness_zero_when_losing_even_with_high_win_rate():
+    assert fitness(m(net=-0.05, wr=0.80), CFG) == 0.0
+
+
+def test_wr_score_saturates_at_70pct():
+    assert fitness(m(wr=0.70), CFG) == pytest.approx(fitness(m(wr=0.90), CFG))
+
+
+def test_select_gate_requires_55pct_win_rate():
+    assert oos_pass(m(pf=1.5, trades=40, wr=0.55), GATE) is False
+    assert oos_pass(m(pf=1.5, trades=40, wr=0.56), GATE) is True
+
+
+HOLD = HoldoutGate()
+
+
+def test_holdout_pass_bar():
+    ok = dict(wr=0.61, pf=1.2, trades=50, net=0.02)
+    assert holdout_pass(m(**ok), HOLD) is True
+    assert holdout_pass(m(**{**ok, "wr": 0.60}), HOLD) is False
+    assert holdout_pass(m(**{**ok, "pf": 1.09}), HOLD) is False
+    assert holdout_pass(m(**{**ok, "trades": 49}), HOLD) is False
+    assert holdout_pass(m(**{**ok, "net": -0.01}), HOLD) is False

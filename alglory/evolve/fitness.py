@@ -11,8 +11,9 @@ from alglory.backtest.metrics import Metrics
 class FitnessConfig:
     min_trades: int = 30
     dd_cap: float = 0.35
-    pf_weight: float = 0.6
-    sharpe_weight: float = 0.4
+    pf_weight: float = 0.4
+    sharpe_weight: float = 0.2
+    wr_weight: float = 0.4
 
 
 def fitness(m: Metrics, cfg: FitnessConfig) -> float:
@@ -20,7 +21,12 @@ def fitness(m: Metrics, cfg: FitnessConfig) -> float:
         return 0.0
     pf_score = min(m.profit_factor, 3.0) / 3.0
     sharpe_score = min(max(m.sharpe, 0.0), 3.0) / 3.0
-    score = cfg.pf_weight * pf_score + cfg.sharpe_weight * sharpe_score
+    wr_score = min(max(m.win_rate, 0.0), 0.70) / 0.70
+    score = (
+        cfg.pf_weight * pf_score
+        + cfg.sharpe_weight * sharpe_score
+        + cfg.wr_weight * wr_score
+    )
     if m.trades < cfg.min_trades:
         score *= m.trades / cfg.min_trades
     dd_penalty = max(0.0, 1.0 - m.max_drawdown / cfg.dd_cap)
@@ -32,6 +38,7 @@ class OOSGate:
     min_pf: float = 1.1
     max_dd: float = 0.30
     min_trades: int = 8
+    min_win_rate: float = 0.55
 
 
 def oos_pass(m: Metrics, gate: OOSGate) -> bool:
@@ -39,5 +46,22 @@ def oos_pass(m: Metrics, gate: OOSGate) -> bool:
         m.net_profit > 0.0
         and m.profit_factor >= gate.min_pf
         and m.max_drawdown <= gate.max_dd
+        and m.trades >= gate.min_trades
+        and m.win_rate > gate.min_win_rate
+    )
+
+
+@dataclass(frozen=True)
+class HoldoutGate:
+    min_win_rate: float = 0.60
+    min_pf: float = 1.1
+    min_trades: int = 50
+
+
+def holdout_pass(m: Metrics, gate: HoldoutGate) -> bool:
+    return (
+        m.net_profit > 0.0
+        and m.win_rate > gate.min_win_rate
+        and m.profit_factor >= gate.min_pf
         and m.trades >= gate.min_trades
     )
