@@ -181,3 +181,20 @@ def test_fake_records_order_calls():
     fake.place_market("EURUSD", 1, 0.02, magic=1)
     fake.close_position("EURUSD", 1)
     assert [o[0] for o in fake.orders] == ["open", "close"]
+
+
+def test_fake_mt5_records_close_deals():
+    from datetime import UTC, datetime, timedelta
+
+    fake = FakeMT5Source()
+    start = datetime.now(UTC) - timedelta(minutes=1)
+    assert fake.deals_since(start).empty
+    fake.place_market("EURUSD", 1, 0.10, magic=990_007)
+    fake.mark_price(1.11)  # no SL/TP: nothing closes
+    fake.close_position("EURUSD", 990_007)
+    d = fake.deals_since(start)
+    assert list(d["entry"]) == ["in", "out"]
+    assert set(d["magic"]) == {990_007}
+    out = d[d["entry"] == "out"].iloc[0]
+    assert out["profit"] > 0  # long, closed above the 1.10 entry
+    assert list(d.columns) == ["time", "magic", "entry", "profit", "commission", "swap"]

@@ -11,11 +11,15 @@ by design; this is a behavioural stand-in, not a market simulator.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
+
+import pandas as pd
 
 from alglory.analysis.sizing import EURUSD_STD, SymbolSpec
 from alglory.data.mt5source import AccountInfo, ConnStatus, OrderResult, PositionInfo
 
 _RETCODE_DONE = 10009
+_DEAL_COLUMNS = ["time", "magic", "entry", "profit", "commission", "swap"]
 
 
 class FakeMT5Source:
@@ -37,6 +41,7 @@ class FakeMT5Source:
         self._positions: list[PositionInfo] = []
         self._next_ticket = 1
         self.orders: list[tuple] = []  # recorded intents: (kind, ...)
+        self._deals: list[dict] = []
 
     # parity with MT5Source's connection surface
     def available(self) -> bool:
@@ -63,6 +68,7 @@ class FakeMT5Source:
             )
             if hit_sl or hit_tp:
                 self._positions.remove(p)
+                self._record_deal(p.magic, "out", self._realised(p))
                 closed.append(p.ticket)
                 self.orders.append(("broker_exit", p.symbol, p.magic))
         return closed
@@ -92,6 +98,7 @@ class FakeMT5Source:
             return OrderResult(False, -1, "zero volume — nothing placed.")
         ticket = self._next_ticket
         self._next_ticket += 1
+        self._record_deal(int(magic), "in", 0.0)
         self._positions.append(
             PositionInfo(ticket, symbol, direction, float(lots), self._price,
                          float(sl), float(tp), int(magic), 0.0)
@@ -110,6 +117,22 @@ class FakeMT5Source:
         for i, p in enumerate(self._positions):
             if p.symbol == symbol and p.magic == magic:
                 del self._positions[i]
+                self._record_deal(p.magic, "out", self._realised(p))
                 self.orders.append(("close", symbol, int(magic)))
                 return True
         return False
+
+    def _realised(self, p: PositionInfo) -> float:
+        """Profit in account currency if ``p`` were closed at the current price."""
+        ticks = (self._price - p.price_open) * p.direction / self._spec.tick_size
+        return ticks * self._spec.tick_value * p.volume
+
+    def _record_deal(self, magic: int, entry: str, profit: float) -> None:
+        self._deals.append({
+            "time": datetime.now(UTC), "magic": int(magic), "entry": entry,
+            "profit": float(profit), "commission": 0.0, "swap": 0.0,
+        })
+
+    def deals_since(self, start: datetime) -> pd.DataFrame:
+        rows = [d for d in self._deals if d["time"] >= start]
+        return pd.DataFrame(rows, columns=_DEAL_COLUMNS)

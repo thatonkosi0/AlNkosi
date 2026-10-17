@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -273,6 +274,26 @@ class MT5Source:
             price=price,
             volume=lots,
         )
+
+    def deals_since(self, start: datetime) -> pd.DataFrame:
+        """Account deals from ``start`` (UTC) to now: time, magic, entry, profit, commission, swap."""
+        self._require_connection()
+        cols = ["time", "magic", "entry", "profit", "commission", "swap"]
+        raw = self._mt5.history_deals_get(start, datetime.now(UTC))
+        if not raw:
+            return pd.DataFrame(columns=cols)
+        rows = [
+            {
+                "time": datetime.fromtimestamp(d.time, UTC),
+                "magic": int(d.magic),
+                "entry": "in" if d.entry == self._mt5.DEAL_ENTRY_IN else "out",
+                "profit": float(d.profit),
+                "commission": float(d.commission),
+                "swap": float(d.swap),
+            }
+            for d in raw
+        ]
+        return pd.DataFrame(rows, columns=cols)
 
     def experts_dir(self) -> Path | None:
         if not self._connected or self._mt5 is None:
