@@ -17,7 +17,9 @@ question behind "does it actually do what it's supposed to do".
 
 from __future__ import annotations
 
+import math
 import re
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pandas as pd
@@ -75,16 +77,173 @@ def parse_mt5_html_report(text: str) -> dict:
     }
 
 
+def read_mt5_report(path: str | Path) -> str:
+    """Read a saved Strategy Tester report; MT5 writes these as UTF-16."""
+    raw = Path(path).read_bytes()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16")
+    return raw.decode("utf-8-sig")
+
+
+class _RowCollector(HTMLParser):
+    """Flatten every <tr> in a document into a list of cell texts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[list[str]] = []
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr":
+            self._row = []
+        elif tag in ("td", "th") and self._row is not None:
+            self._cell = []
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self._row is not None and self._cell is not None:
+            self._row.append(" ".join("".join(self._cell).split()))
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            self.rows.append(self._row)
+            self._row = None
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell.append(data)
+
+
+def _exit_bucket(comment: str) -> str:
+    """MT5 tags stop exits 'sl …' / 'tp …'; anything else is an EA close."""
+    word = comment.strip().split(" ", 1)[0].lower()
+    return word if word in ("sl", "tp") else "close"
+
+
+def parse_mt5_deals(text: str) -> list[dict]:
+    """Rebuild round-trip trades from an MT5 report's Deals table.
+
+    Each ``in`` deal is paired with the next ``out`` deal (the EA holds one
+    position at a time). Returns dicts with ``entry_time``, ``exit_time``,
+    ``direction`` (1 long / -1 short) and ``exit_reason`` bucketed to
+    'sl' | 'tp' | 'close' — the tester's comment cannot tell a trailed or
+    breakeven stop from the original SL, nor a time exit from a signal close.
+    """
+    p = _RowCollector()
+    p.feed(text)
+    rows = p.rows
+    start = next((i for i, r in enumerate(rows) if r == ["Deals"]), None)
+    if start is None or start + 1 >= len(rows):
+        return []
+    header = rows[start + 1]
+    col = {name: i for i, name in enumerate(header)}
+    if not {"Time", "Type", "Direction", "Comment"} <= col.keys():
+        return []
+
+    trades: list[dict] = []
+    open_deal: dict | None = None
+    for r in rows[start + 2:]:
+        if len(r) != len(header):
+            break  # next report section
+        direction = r[col["Direction"]].lower()
+        when = pd.to_datetime(r[col["Time"]], format="%Y.%m.%d %H:%M:%S")
+        if direction == "in":
+            side = r[col["Type"]].lower()
+            open_deal = {"entry_time": when, "direction": 1 if side == "buy" else -1}
+        elif direction == "out" and open_deal is not None:
+            trades.append(
+                {
+                    **open_deal,
+                    "exit_time": when,
+                    "exit_reason": _exit_bucket(r[col["Comment"]]),
+                }
+            )
+            open_deal = None
+    return trades
+
+
+_PY_EXIT_BUCKET = {
+    "sl": "sl", "trail": "sl", "be": "sl",  # all are a stop hit inside MT5
+    "tp": "tp",
+    "time": "close", "signal": "close", "end": "close",  # EA-initiated closes
+}
+
+
+def compare_trades(
+    py_trades: pd.DataFrame,
+    mt5_trades: list[dict],
+    bars: pd.DataFrame,
+    *,
+    tol: float = 0.03,
+) -> dict:
+    """Diff the backtest blotter against MT5 trades, one trade at a time.
+
+    Trades are aligned by entry bar (MT5 fill times floored onto ``bars``),
+    then direction, exit bar and bucketed exit reason are compared. Unlike
+    ``compare_summaries`` this catches management genes (trail, breakeven,
+    time exit) that move exits without moving the trade count.
+
+    ``first_divergence`` is the headline: once one trade differs every later
+    one can shift, so the earliest mismatch is where to start looking.
+    ``tol`` is the fraction of divergent trades still called a MATCH, to
+    absorb tick-vs-bar fill noise.
+    """
+    times = pd.to_datetime(bars["time"]).reset_index(drop=True)
+
+    def bar_of(t) -> int:
+        return int(times.searchsorted(pd.Timestamp(t), side="right")) - 1
+
+    mt5_by_entry = {bar_of(t["entry_time"]): t for t in mt5_trades}
+    py_by_entry = {int(r.entry_i): r for r in py_trades.itertuples()}
+
+    divergences: list[dict] = []
+    matched = 0
+    for entry_i, r in py_by_entry.items():
+        m = mt5_by_entry.get(entry_i)
+        if m is None:
+            divergences.append({"entry_i": entry_i, "fields": ["missing_in_mt5"]})
+            continue
+        fields = []
+        if int(r.direction) != m["direction"]:
+            fields.append("direction")
+        if int(r.exit_i) != bar_of(m["exit_time"]):
+            fields.append("exit_i")
+        if _PY_EXIT_BUCKET.get(r.reason, r.reason) != m["exit_reason"]:
+            fields.append("exit_reason")
+        if fields:
+            divergences.append({"entry_i": entry_i, "fields": fields})
+        else:
+            matched += 1
+    extra = sorted(set(mt5_by_entry) - set(py_by_entry))
+    divergences += [{"entry_i": i, "fields": ["extra_in_mt5"]} for i in extra]
+    divergences.sort(key=lambda d: d["entry_i"])
+
+    total = max(len(py_by_entry), len(mt5_by_entry), 1)
+    ok = len(divergences) / total <= tol
+    return {
+        "match": ok,
+        "verdict": "MATCH" if ok else "DIVERGE",
+        "matched": matched,
+        "divergent": len(divergences),
+        "first_divergence": divergences[0] if divergences else None,
+        "divergences": divergences,
+        "missing_in_mt5": sorted(set(py_by_entry) - set(mt5_by_entry)),
+        "extra_in_mt5": extra,
+    }
+
+
 def compare_summaries(
     py: dict,
     mt5: dict,
     *,
     trade_tol: float = 0.15,
+    pf_tol: float = 0.25,
     profit_sign_must_match: bool = True,
 ) -> dict:
     """Diff a Python summary against an MT5 summary into a verdict.
 
     ``trade_tol`` is the allowed relative gap in trade count (defaults to 15%).
+    ``pf_tol`` is the allowed relative gap in profit factor (defaults to 25%);
+    profit factor is unitless, so unlike net profit it compares directly.
     A profit-sign disagreement (backtest wins, MT5 loses, or vice-versa) is
     always a divergence when ``profit_sign_must_match`` is set.
     """
@@ -109,6 +268,15 @@ def compare_summaries(
         if (p_np > 0) != (m_np > 0):
             reasons.append(
                 f"net-profit sign disagrees (python {p_np:+.4f} vs mt5 {m_np:+.2f})."
+            )
+
+    p_pf, m_pf = py.get("profit_factor"), mt5.get("profit_factor")
+    if p_pf is not None and m_pf is not None and math.isfinite(p_pf) and p_pf > 0:
+        rel = abs(m_pf - p_pf) / p_pf
+        if rel > pf_tol:
+            reasons.append(
+                f"profit factor differs by {rel:.0%} (python {p_pf:.2f} vs mt5 {m_pf:.2f}); "
+                f"tolerance {pf_tol:.0%}."
             )
 
     return {
@@ -158,12 +326,16 @@ def export_bundle(
     bars_csv = out_dir / "bars.csv"
     bars.to_csv(bars_csv, index=False)
 
+    # bar-open times let compare_trades line the blotter up with MT5 deals
+    times = pd.to_datetime(bars["time"]).reset_index(drop=True)
     trades_csv = out_dir / "python_trades.csv"
     pd.DataFrame(
         [
             {
                 "entry_i": t.entry_i,
                 "exit_i": t.exit_i,
+                "entry_time": times[t.entry_i],
+                "exit_time": times[t.exit_i],
                 "direction": t.direction,
                 "entry": t.entry,
                 "exit": t.exit,
@@ -208,12 +380,16 @@ def _readme(name: str, symbol: str, timeframe: str, summary: dict) -> str:
         "     Use 'Every tick based on real ticks' for the most faithful run.\n"
         "  5. Keep the EA inputs at their defaults (they encode the vaulted genome).\n"
         "  6. Run, then right-click the Results tab -> 'Save as Report' (HTML).\n"
-        "  7. Diff it here:\n"
-        "       from alglory.analysis.parity import parse_mt5_html_report, compare_summaries\n"
-        "       import json\n"
-        "       mt5 = parse_mt5_html_report(open('report.html', encoding='utf-8').read())\n"
+        "  7. Diff it here (summary first, then trade by trade):\n"
+        "       import json, pandas as pd\n"
+        "       from alglory.analysis.parity import (read_mt5_report, parse_mt5_html_report,\n"
+        "           parse_mt5_deals, compare_summaries, compare_trades)\n"
+        "       html = read_mt5_report('report.html')\n"
         "       py  = json.load(open('python_summary.json'))\n"
-        "       print(compare_summaries(py, mt5))\n\n"
+        "       print(compare_summaries(py, parse_mt5_html_report(html)))\n"
+        "       print(compare_trades(pd.read_csv('python_trades.csv'),\n"
+        "                            parse_mt5_deals(html), pd.read_csv('bars.csv')))\n\n"
         "A DIVERGE verdict means the tester did NOT reproduce the backtest edge:\n"
-        "treat the strategy as unproven until it matches.\n"
+        "treat the strategy as unproven until it matches. compare_trades'\n"
+        "first_divergence names the first bar where the EA and backtest part ways.\n"
     )
