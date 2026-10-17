@@ -17,7 +17,7 @@ from __future__ import annotations
 import pandas as pd
 
 from alglory.analysis.activity import trade_activity
-from alglory.backtest.engine import Costs, run_backtest
+from alglory.backtest.engine import Costs, effective_spread, run_backtest
 from alglory.backtest.metrics import compute_metrics
 from alglory.analysis.walkforward import walk_forward_matrix
 from alglory.data.cache import InsufficientDataError
@@ -96,7 +96,7 @@ def rescore_vault(
     bars = cache.load(symbol, timeframe)
     if bars is None or len(bars) < 50:
         return {"scored": 0, "skipped": 0, "reason": "no cached bars for this symbol/timeframe"}
-    costs = Costs(spread=float(bars["spread"].median()), commission_per_lot=commission_per_lot)
+    costs = Costs(spread=effective_spread(bars), commission_per_lot=commission_per_lot)
     rows = vault.list_strategies(symbol=symbol, timeframe=timeframe, limit=100_000)
     scored = 0
     for row in rows:

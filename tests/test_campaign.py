@@ -1,11 +1,11 @@
-import json
+﻿import json
 
 import numpy as np
 import pytest
 from pydantic import ValidationError
 
 from alglory.data.cache import BarCache
-from alglory.evolve.campaign import CampaignConfig, run_campaign
+from alglory.evolve.campaign import CampaignConfig, _spread_floor, run_campaign
 from alglory.genome import random_genome
 from alglory.vault.db import Vault
 
@@ -192,7 +192,7 @@ def test_campaign_resumes_from_checkpoint(vault, cache):
 
     gens = [e for e in events2 if e["type"] == "generation"]
     total = started["total_units"]
-    # picks up exactly where the checkpoint left off — no unit is redone
+    # picks up exactly where the checkpoint left off â€” no unit is redone
     assert len(gens) == total - units_before
     assert gens[0]["units_done"] == units_before + 1
     assert gens[-1]["units_done"] == total
@@ -239,7 +239,7 @@ def test_robustness_scoring_failure_is_logged(monkeypatch, vault, cache):
     Reaching that try/except needs at least one strategy to vault. Whether a
     real GA run vaults anything is non-deterministic (OOS gating on evolved
     genomes), so this used to be forced with a 40-population/15-generation
-    two-tribe campaign — ~40s, and still only *probably* vaulting. Instead,
+    two-tribe campaign â€” ~40s, and still only *probably* vaulting. Instead,
     inject exactly one vaulted genome into the first generation's result: the
     vaulting path then runs deterministically and the GA stays tiny.
     """
@@ -260,7 +260,7 @@ def test_robustness_scoring_failure_is_logged(monkeypatch, vault, cache):
         for result in real_evolve_tribe(*args, **kwargs):
             if not injected:
                 injected.append(result.top.genome)
-                # (genome, is_metrics, oos_metrics) — the campaign only reads
+                # (genome, is_metrics, oos_metrics) â€” the campaign only reads
                 # .to_dict()/.net_profit off these, so the top candidate's own
                 # in-sample metrics stand in for both.
                 result.vaulted = [
@@ -314,3 +314,24 @@ def test_optimize_fails_loudly_when_seed_tribe_not_selected(vault, cache):
     finished = next(e for e in events if e["type"] == "campaign_finished")
     assert finished["status"] == "failed"
     assert "not in the selected tribes" in (finished["error"] or "")
+
+
+# ---- spread floor -------------------------------------------------------
+
+
+def test_min_spread_defaults_to_one_pip():
+    assert CampaignConfig(**TINY).min_spread_pips == 1.0
+
+
+def test_spread_floor_is_pips_on_a_five_digit_quote():
+    # EURUSD: tick 0.00001 -> 1 pip = 0.0001; a thin 0.4-pip broker quote loses
+    assert _spread_floor(1.0, tick_size=1e-05, broker_spread=4e-05) == pytest.approx(1e-04)
+
+
+def test_spread_floor_follows_the_symbol_tick_size():
+    # USDJPY: tick 0.001 -> 1 pip = 0.01 (a fixed price floor would be 100x off)
+    assert _spread_floor(1.0, tick_size=1e-03, broker_spread=0.0) == pytest.approx(1e-02)
+
+
+def test_spread_floor_respects_a_wider_live_broker_spread():
+    assert _spread_floor(1.0, tick_size=1e-05, broker_spread=2.5e-04) == pytest.approx(2.5e-04)

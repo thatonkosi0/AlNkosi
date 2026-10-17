@@ -39,6 +39,19 @@ class Costs:
         return self.spread + self.commission_per_lot
 
 
+def effective_spread(bars: pd.DataFrame, floor: float = 0.0) -> float:
+    """Typical spread to charge a backtest, from the bars' ``spread`` column.
+
+    Zero-spread bars are ignored: broker history (MetaQuotes-Demo especially)
+    records 0 on many bars, which no real fill ever gets, so a plain median
+    collapses toward free trading. The result never drops below ``floor``.
+    """
+    s = bars["spread"]
+    nonzero = s[s > 0]
+    typical = float(nonzero.median()) if len(nonzero) else 0.0
+    return max(typical, floor)
+
+
 @dataclass(frozen=True)
 class Trade:
     entry_i: int

@@ -15,7 +15,7 @@ from typing import Callable
 import numpy as np
 from pydantic import BaseModel, Field, field_validator
 
-from alglory.backtest.engine import Costs
+from alglory.backtest.engine import Costs, effective_spread
 from alglory.validation import validate_symbol
 from alglory.data.cache import BarCache, check_sufficiency
 from alglory.data.sample import generate_bars
@@ -43,6 +43,9 @@ class CampaignConfig(BaseModel):
     min_trades: int = Field(default=30, ge=1)
     dd_cap: float = Field(default=0.35, gt=0.0, le=1.0)
     commission_per_lot: float = Field(default=0.0, ge=0.0)
+    # Backtest spread is never charged below this many pips (MT5 source),
+    # nor below the broker's live spread; history alone under-reports it.
+    min_spread_pips: float = Field(default=1.0, ge=0.0)
     # Retrain/optimize: seed the population from this vaulted strategy's
     # genome (plus mutants of it) instead of starting from random genomes.
     seed_strategy_id: int | None = None
@@ -82,10 +85,21 @@ def _downsample(equity: np.ndarray, n: int = EQUITY_POINTS) -> list[float]:
     return [float(x) for x in equity[idx]]
 
 
+def _spread_floor(min_spread_pips: float, tick_size: float, broker_spread: float) -> float:
+    """Lowest spread (price units) a backtest may charge for one symbol.
+
+    A pip is 10 ticks on fractional-pip quotes (EURUSD 0.0001, USDJPY 0.01),
+    so the floor scales with the symbol instead of being one fixed price.
+    """
+    return max(min_spread_pips * 10 * tick_size, broker_spread)
+
+
 def _load_bars(cfg: CampaignConfig, symbol: str, cache: BarCache, emit):
+    """Return (bars, spread_floor) for one symbol."""
     if cfg.source == "sample":
         emit({"type": "log", "line": f"generating sample data for {symbol} {cfg.timeframe}"})
-        return generate_bars(symbol, cfg.timeframe, SAMPLE_BARS, seed=cfg.seed or 7)
+        # synthetic bars carry a realistic spread on every bar; no floor needed
+        return generate_bars(symbol, cfg.timeframe, SAMPLE_BARS, seed=cfg.seed or 7), 0.0
     from alglory.data.mt5source import MT5Source
 
     src = MT5Source()
@@ -95,7 +109,10 @@ def _load_bars(cfg: CampaignConfig, symbol: str, cache: BarCache, emit):
     emit({"type": "log", "line": f"downloading {symbol} {cfg.timeframe} history from MT5 ({status.account})"})
     bars = src.fetch_bars(symbol, cfg.timeframe, 20000)
     cache.save(symbol, cfg.timeframe, bars)
-    return bars
+    floor = _spread_floor(
+        cfg.min_spread_pips, src.symbol_spec(symbol).tick_size, src.symbol_spread(symbol)
+    )
+    return bars, floor
 
 
 def _wait_while_paused(
@@ -220,13 +237,13 @@ def run_campaign(
         for s_idx, symbol in enumerate(cfg.symbols):
             if s_idx < sym_start:
                 continue
-            bars = _load_bars(cfg, symbol, cache, emit)
+            bars, spread_floor = _load_bars(cfg, symbol, cache, emit)
             check_sufficiency(bars, MIN_BARS)
             split = int(len(bars) * (1.0 - cfg.oos_fraction))
             bars_is = bars.iloc[:split].reset_index(drop=True)
             bars_oos = bars.iloc[split:].reset_index(drop=True)
             costs = Costs(
-                spread=float(bars["spread"].median()),
+                spread=effective_spread(bars, floor=spread_floor),
                 commission_per_lot=cfg.commission_per_lot,
             )
             emit(

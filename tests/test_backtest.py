@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from alglory.backtest.engine import Costs, build_signals, run_backtest
+from alglory.backtest.engine import Costs, build_signals, effective_spread, run_backtest
 from alglory.genome import (
     FilterGene,
     Genome,
@@ -344,3 +344,28 @@ def test_build_signals_is_causal(bars_h1):
     full = build_signals(g, bars_h1)
     partial = build_signals(g, bars_h1.iloc[:3000].reset_index(drop=True))
     assert np.array_equal(full[:3000], partial)
+
+
+# ---- effective_spread ---------------------------------------------------
+
+
+def _spread_bars(values):
+    return pd.DataFrame({"spread": np.asarray(values, dtype=float)})
+
+
+def test_effective_spread_ignores_zero_spread_bars():
+    # Regression: MetaQuotes-Demo history reports spread 0 on ~half its bars
+    # (92% in 2026), so a plain median charged ~0.1 pip and made every
+    # high-frequency strategy look free to run.
+    bars = _spread_bars([0, 0, 0, 0.00003, 0.00003])
+    assert effective_spread(bars) == pytest.approx(0.00003)
+
+
+def test_effective_spread_never_below_floor():
+    bars = _spread_bars([0.00003] * 5)
+    assert effective_spread(bars, floor=0.0001) == pytest.approx(0.0001)
+
+
+def test_effective_spread_all_zero_falls_back_to_floor():
+    assert effective_spread(_spread_bars([0, 0, 0]), floor=0.0001) == pytest.approx(0.0001)
+    assert effective_spread(_spread_bars([0, 0, 0])) == 0.0
