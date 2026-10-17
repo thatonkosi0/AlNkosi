@@ -18,12 +18,22 @@ def _net(deals: pd.DataFrame) -> pd.Series:
 
 
 def demo_stats(deals: pd.DataFrame, magic: int) -> dict:
-    out = deals[(deals["magic"] == magic) & (deals["entry"] == "out")]
-    if out.empty:
+    """A trade's result is its out-deal's profit+commission+swap plus the
+    commission+swap of the in-deal that opened it (most recent unmatched in)."""
+    mine = deals[deals["magic"] == magic].sort_values("time", kind="stable")
+    results: list[float] = []
+    open_cost: float | None = None
+    for row in mine.itertuples():
+        cost = float(row.commission) + float(row.swap)
+        if row.entry == "in":
+            open_cost = cost
+        elif row.entry == "out":
+            results.append(float(row.profit) + cost + (open_cost or 0.0))
+            open_cost = None
+    if not results:
         return {"trades": 0, "wins": 0, "win_rate": 0.0, "net": 0.0}
-    net = _net(out)
-    trades, wins = len(out), int((net > 0).sum())
-    return {"trades": trades, "wins": wins, "win_rate": wins / trades, "net": float(net.sum())}
+    trades, wins = len(results), sum(r > 0 for r in results)
+    return {"trades": trades, "wins": wins, "win_rate": wins / trades, "net": float(sum(results))}
 
 
 def account_prop(deals: pd.DataFrame, current_balance: float) -> tuple[PropMetrics, dict[date, float]]:

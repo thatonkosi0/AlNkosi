@@ -78,3 +78,23 @@ def test_decide_stage_rules():
     loss = {**good, "net": -1.0}
     stage, why = decide_stage(loss, start, d21, False)
     assert stage == "demo_failed" and "net" in why
+
+
+def test_demo_stats_includes_opening_deal_costs():
+    d = _deals([
+        (T0, 990_001, "in", 0.0, -7.0, 0.0),
+        (T0 + timedelta(hours=1), 990_001, "out", 5.0, 0.0, 0.0),
+    ])
+    s = demo_stats(d, 990_001)
+    assert s["trades"] == 1 and s["wins"] == 0 and s["net"] == -2.0
+
+
+def test_demo_stats_out_without_preceding_in_still_counts():
+    d = _deals([
+        (T0, 990_001, "out", 5.0, -1.0, 0.0),
+        (T0 + timedelta(hours=1), 990_001, "in", 0.0, -3.0, 0.0),
+        (T0 + timedelta(hours=2), 990_001, "out", 10.0, 0.0, 0.0),
+        (T0, 990_002, "in", 0.0, -50.0, 0.0),  # other magic must not leak in
+    ])
+    s = demo_stats(d, 990_001)
+    assert s == {"trades": 2, "wins": 2, "win_rate": 1.0, "net": 11.0}
