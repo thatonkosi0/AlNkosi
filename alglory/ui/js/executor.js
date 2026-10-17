@@ -105,22 +105,12 @@ export function initExecutor() {
       const pct = (x) => `${(x * 100).toFixed(1)}%`;
       let msg = `Combined (${payload.preset}): worst day ${pct(pre.worst_day_loss)}, ` +
         `max drawdown ${pct(pre.max_drawdown)}.`;
-      if (pre.breaches.length) msg += `
-
-BREACHES:
-- ${pre.breaches.join("
-- ")}`;
+      if (pre.breaches.length) msg += `\n\nBREACHES:\n- ${pre.breaches.join("\n- ")}`;
       if (pre.excluded.length) {
-        msg += `
-
-EXCLUDED from the check:
-- ` +
-          pre.excluded.map((x) => `#${x.id}: ${x.reason}`).join("
-- ");
+        msg += "\n\nEXCLUDED from the check:\n- " +
+          pre.excluded.map((x) => `#${x.id}: ${x.reason}`).join("\n- ");
       }
-      msg += "
-
-Arm anyway?";
+      msg += "\n\nArm anyway?";
       if (!confirm(msg)) return;
       const s = await api("/api/executor/arm", { method: "POST", body: JSON.stringify(payload) });
       line(`>> armed ${ids.length} strateg${ids.length > 1 ? "ies" : "y"} in ${payload.mode.toUpperCase()} mode`);
