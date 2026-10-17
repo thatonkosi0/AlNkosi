@@ -22,7 +22,7 @@ def cache(tmp_path):
 
 TINY = dict(
     symbols=["EURUSD"],
-    timeframe="H1",
+    timeframes=["H1"],
     tribes=["trend", "momentum"],
     population=8,
     generations=3,
@@ -314,3 +314,55 @@ def test_optimize_fails_loudly_when_seed_tribe_not_selected(vault, cache):
     finished = next(e for e in events if e["type"] == "campaign_finished")
     assert finished["status"] == "failed"
     assert "not in the selected tribes" in (finished["error"] or "")
+
+
+def test_legacy_config_still_parses():
+    cfg = CampaignConfig(
+        symbols=["EURUSD"], timeframe="H1", tribes=["trend"], oos_fraction=0.25
+    )
+    assert cfg.timeframes == ["H1"]
+    assert cfg.select_fraction == 0.25
+    assert cfg.holdout_fraction == 0.2
+    assert cfg.target_preset == "personal"
+
+
+def test_config_rejects_bad_preset_and_timeframes():
+    with pytest.raises(ValidationError):
+        CampaignConfig(symbols=["EURUSD"], tribes=["trend"], target_preset="nope")
+    with pytest.raises(ValidationError):
+        CampaignConfig(symbols=["EURUSD"], tribes=["trend"], timeframes=["M3"])
+    with pytest.raises(ValidationError):
+        CampaignConfig(symbols=["EURUSD"], tribes=["trend"], timeframes=[])
+
+
+def test_campaign_runs_every_timeframe(vault, cache):
+    one = _run(TINY, vault, cache)[0]["total_units"]
+    events = _run(dict(TINY, timeframes=["H1", "H4"]), vault, cache)
+    assert events[0]["total_units"] == one * 2
+    gens = [e for e in events if e["type"] == "generation"]
+    assert len(gens) == one * 2
+    tfs = [g["timeframe"] for g in gens]
+    assert set(tfs) == {"H1", "H4"}
+    assert tfs == sorted(tfs, key=["H1", "H4"].index)  # H1 units before H4
+    for e in events:
+        if e["type"] == "strategy_vaulted":
+            assert e["timeframe"] in {"H1", "H4"}
+    assert events[-1]["status"] == "done"
+
+
+def test_resume_state_includes_timeframe():
+    from alglory.evolve.campaign import _resume_state
+
+    cfg = CampaignConfig(
+        **dict(TINY, timeframes=["H1", "H4"], symbols=["EURUSD", "GBPUSD"])
+    )
+    ckpt = {"symbol": "EURUSD", "timeframe": "H4", "tribe": "trend", "gen": 1,
+            "population": None}
+    assert _resume_state(cfg, ckpt) == (0, 1, 0, 0, None)
+    # last gen of last tribe at last timeframe rolls to the next symbol
+    ckpt = {"symbol": "EURUSD", "timeframe": "H4", "tribe": "momentum", "gen": 3,
+            "population": None}
+    assert _resume_state(cfg, ckpt) == (1, 0, 0, 0, None)
+    # old checkpoints without a timeframe resume at the first timeframe
+    ckpt = {"symbol": "EURUSD", "tribe": "trend", "gen": 1, "population": None}
+    assert _resume_state(cfg, ckpt)[1] == 0

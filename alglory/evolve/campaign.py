@@ -14,7 +14,7 @@ from typing import Callable
 
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from alglory.backtest.engine import Costs, effective_spread
 from alglory.validation import validate_symbol
@@ -23,6 +23,8 @@ from alglory.data.sample import generate_bars
 from alglory.evolve.costs import commission_price, resolve_profile
 from alglory.evolve.fitness import FitnessConfig, OOSGate
 from alglory.evolve.ga import GAParams, evolve_tribe
+from alglory.evolve.split import split_bars
+from alglory.deploy.mql5 import GUARDRAIL_PRESETS
 from alglory.genome import TRIBES, Genome, mutate
 from alglory.vault.db import Vault
 
@@ -36,11 +38,15 @@ BARS_PER_YEAR = {"M15": 24960.0, "H1": 6240.0, "H4": 1560.0, "D1": 260.0}
 
 class CampaignConfig(BaseModel):
     symbols: list[str] = Field(min_length=1)
-    timeframe: str = "H1"
+    timeframes: list[str] = Field(default_factory=lambda: ["H1"], min_length=1)
     tribes: list[str] = Field(min_length=1)
     population: int = Field(default=40, ge=4, le=400)
     generations: int = Field(default=15, ge=1, le=200)
-    oos_fraction: float = Field(default=0.25, gt=0.05, lt=0.9)
+    select_fraction: float = Field(default=0.2, gt=0.05, lt=0.9)
+    holdout_fraction: float = Field(default=0.2, gt=0.05, lt=0.9)
+    min_holdout_trades: int = Field(default=50, ge=1)
+    target_preset: str = "personal"
+    keep_per_market: int = Field(default=3, ge=1)
     seed: int | None = None
     source: str = "sample"
     min_trades: int = Field(default=30, ge=1)
@@ -52,11 +58,33 @@ class CampaignConfig(BaseModel):
     # genome (plus mutants of it) instead of starting from random genomes.
     seed_strategy_id: int | None = None
 
-    @field_validator("timeframe")
+    @model_validator(mode="before")
     @classmethod
-    def _tf(cls, v):
-        if v not in BARS_PER_YEAR:
-            raise ValueError(f"timeframe must be one of {sorted(BARS_PER_YEAR)}")
+    def _legacy_fields(cls, data):
+        """Accept the pre-multi-timeframe `timeframe` / `oos_fraction` fields."""
+        if isinstance(data, dict):
+            data = dict(data)
+            if "timeframe" in data:
+                tf = data.pop("timeframe")
+                data.setdefault("timeframes", [tf])
+            if "oos_fraction" in data:
+                frac = data.pop("oos_fraction")
+                data.setdefault("select_fraction", frac)
+        return data
+
+    @field_validator("timeframes")
+    @classmethod
+    def _tfs(cls, v):
+        bad = [t for t in v if t not in BARS_PER_YEAR]
+        if bad:
+            raise ValueError(f"timeframes must be from {sorted(BARS_PER_YEAR)}; got {bad}")
+        return v
+
+    @field_validator("target_preset")
+    @classmethod
+    def _preset(cls, v):
+        if v not in GUARDRAIL_PRESETS:
+            raise ValueError(f"target_preset must be one of {sorted(GUARDRAIL_PRESETS)}")
         return v
 
     @field_validator("tribes")
@@ -146,10 +174,15 @@ def _seed_population(genome: Genome, size: int, rng: np.random.Generator) -> lis
     return pop
 
 
-def _resume_state(cfg: CampaignConfig, ckpt: dict) -> tuple[int, int, int, list[Genome] | None]:
-    """Where a checkpointed campaign continues: symbol idx, tribe idx,
-    start generation, and the population to seed the resumed tribe with."""
+def _resume_state(
+    cfg: CampaignConfig, ckpt: dict
+) -> tuple[int, int, int, int, list[Genome] | None]:
+    """Where a checkpointed campaign continues: symbol idx, timeframe idx,
+    tribe idx, start generation, and the population to seed the resumed
+    tribe with."""
     sym_start = cfg.symbols.index(ckpt["symbol"])
+    # checkpoints from before multi-timeframe campaigns carry no timeframe
+    tf_start = cfg.timeframes.index(ckpt["timeframe"]) if ckpt.get("timeframe") else 0
     tribe_start = cfg.tribes.index(ckpt["tribe"])
     start_gen = int(ckpt["gen"])  # checkpoint gen is 1-based == next 0-based gen
     pop_json = ckpt.get("population")
@@ -161,12 +194,15 @@ def _resume_state(cfg: CampaignConfig, ckpt: dict) -> tuple[int, int, int, list[
         start_gen, population = 0, None
         if tribe_start >= len(cfg.tribes):
             tribe_start = 0
-            sym_start += 1
+            tf_start += 1
+            if tf_start >= len(cfg.timeframes):
+                tf_start = 0
+                sym_start += 1
     elif population is None:
         # checkpoint predates population snapshots: redo the tribe (the
         # vault-seeded dedupe set prevents duplicate strategies)
         start_gen = 0
-    return sym_start, tribe_start, start_gen, population
+    return sym_start, tf_start, tribe_start, start_gen, population
 
 
 def run_campaign(
@@ -178,7 +214,7 @@ def run_campaign(
     should_pause: Callable[[], bool] | None = None,
     resume_campaign_id: int | None = None,
 ) -> None:
-    sym_start = tribe_start = resume_gen = 0
+    sym_start = tf_start = tribe_start = resume_gen = 0
     resume_pop: list[Genome] | None = None
     resuming = resume_campaign_id is not None
     if resuming:
@@ -188,7 +224,7 @@ def run_campaign(
         ckpt = json.loads(row["progress_json"])
         campaign_id = resume_campaign_id
         vault.update_campaign(campaign_id, status="running")
-        sym_start, tribe_start, resume_gen, resume_pop = _resume_state(cfg, ckpt)
+        sym_start, tf_start, tribe_start, resume_gen, resume_pop = _resume_state(cfg, ckpt)
         vaulted_total = int(ckpt.get("vaulted_total", 0))
         units_done = int(ckpt.get("units_done", 0))
     else:
@@ -196,7 +232,9 @@ def run_campaign(
         vaulted_total = 0
         units_done = 0
 
-    total_units = len(cfg.symbols) * len(cfg.tribes) * cfg.generations
+    total_units = (
+        len(cfg.symbols) * len(cfg.timeframes) * len(cfg.tribes) * cfg.generations
+    )
     emit(
         {
             "type": "campaign_started",
@@ -245,155 +283,162 @@ def run_campaign(
         for s_idx, symbol in enumerate(cfg.symbols):
             if s_idx < sym_start:
                 continue
-            bars, costs = _load_bars(cfg, symbol, cfg.timeframe, cache, emit)
-            check_sufficiency(bars, MIN_BARS)
-            split = int(len(bars) * (1.0 - cfg.oos_fraction))
-            bars_is = bars.iloc[:split].reset_index(drop=True)
-            bars_oos = bars.iloc[split:].reset_index(drop=True)
-            emit(
-                {
-                    "type": "log",
-                    "line": f"{symbol}: {split} bars in-sample / {len(bars) - split} out-of-sample",
-                }
-            )
-
-            for t_idx, tribe in enumerate(cfg.tribes):
-                if s_idx == sym_start and t_idx < tribe_start:
+            for tf_idx, timeframe in enumerate(cfg.timeframes):
+                if s_idx == sym_start and tf_idx < tf_start:
                     continue
-                is_resumed_tribe = resuming and s_idx == sym_start and t_idx == tribe_start
-                _wait_while_paused(should_pause, should_stop, emit)
-                if should_stop():
-                    raise _Cancelled()
-                emit({"type": "log", "line": f"breeding tribe '{tribe}' on {symbol}"})
-                seed = (cfg.seed if cfg.seed is not None else int(time.time())) + t_idx * 1000
-                initial = None
-                if is_resumed_tribe:
-                    initial = resume_pop
-                elif seed_genome is not None and tribe == seed_tribe:
-                    initial = _seed_population(
-                        seed_genome, cfg.population, np.random.default_rng(seed)
-                    )
-                for result in evolve_tribe(
-                    tribe,
-                    bars_is,
-                    bars_oos,
-                    costs,
-                    ga,
-                    fit_cfg,
-                    gate,
-                    seed=seed,
-                    bars_per_year=BARS_PER_YEAR[cfg.timeframe],
-                    initial=resume_pop if is_resumed_tribe else None,
-                    start_gen=resume_gen if is_resumed_tribe else 0,
-                    already_vaulted=(
-                        vault.campaign_tribe_genomes(campaign_id, symbol, tribe)
-                        if is_resumed_tribe
-                        else None
-                    ),
-                ):
-                    for genome, is_m, oos_m in result.vaulted:
-                        from alglory.backtest.engine import run_backtest
+                bars, costs = _load_bars(cfg, symbol, timeframe, cache, emit)
+                check_sufficiency(bars, MIN_BARS)
+                bars_breed, bars_select, bars_holdout = split_bars(
+                    bars, cfg.select_fraction, cfg.holdout_fraction
+                )
+                emit(
+                    {
+                        "type": "log",
+                        "line": f"{symbol} {timeframe}: {len(bars_breed)} bars breed / "
+                        f"{len(bars_select)} select / {len(bars_holdout)} holdout",
+                    }
+                )
 
-                        oos_equity = run_backtest(genome, bars_oos, costs).equity
-                        sid = vault.add_strategy(
-                            name=None,
-                            tribe=tribe,
-                            symbol=symbol,
-                            timeframe=cfg.timeframe,
-                            genome_json=genome.to_json(),
-                            is_metrics=is_m.to_dict(),
-                            oos_metrics=oos_m.to_dict(),
-                            equity=oos_equity,
-                            campaign_id=campaign_id,
-                        )
-                        # score walk-forward robustness at insert so the vault
-                        # ranks new strategies without a manual rescore. Scored
-                        # on the full series; best-effort — never break vaulting.
-                        grade = None
-                        try:
-                            from alglory.analysis.robustness import robustness
-
-                            r = robustness(
-                                genome, bars, costs,
-                                BARS_PER_YEAR[cfg.timeframe], timeframe=cfg.timeframe,
-                            )
-                            vault.set_robustness(sid, r["grade"], r["score"])
-                            grade = r["grade"]
-                        except Exception as exc:  # noqa: BLE001 - scoring must not abort a campaign
-                            emit({"type": "log", "line": f"robustness scoring failed for strategy {sid}: {exc}"})
-                        vaulted_total += 1
-                        row = vault.get_strategy(sid)
-                        emit(
-                            {
-                                "type": "strategy_vaulted",
-                                "strategy_id": sid,
-                                "name": row["name"],
-                                "tribe": tribe,
-                                "symbol": symbol,
-                                "oos_net_profit": oos_m.net_profit,
-                                "robustness_grade": grade,
-                            }
-                        )
-
-                    order = sorted(
-                        range(len(result.evaluated)),
-                        key=lambda i: result.evaluated[i].fit,
-                        reverse=True,
-                    )
-                    top_equity = []
-                    for i in order[:TOP_CURVES]:
-                        ev = result.evaluated[i]
-                        if ev.fit <= 0:
-                            continue
-                        from alglory.backtest.engine import run_backtest
-
-                        eq = run_backtest(ev.genome, bars_is, costs).equity
-                        top_equity.append(
-                            {"id": f"G{result.gen}-{i}", "points": _downsample(eq)}
-                        )
-
-                    units_done += 1
-                    emit(
-                        {
-                            "type": "generation",
-                            "campaign_id": campaign_id,
-                            "symbol": symbol,
-                            "tribe": tribe,
-                            "gen": result.gen + 1,
-                            "of": cfg.generations,
-                            "top_fitness": result.top.fit,
-                            "survivors": result.survivors,
-                            "culled": result.culled,
-                            "population": len(result.evaluated),
-                            "top_equity": top_equity,
-                            "vaulted_count_total": vaulted_total,
-                            "units_done": units_done,
-                            "total_units": total_units,
-                        }
-                    )
-                    vault.update_campaign(
-                        campaign_id,
-                        progress_json=json.dumps(
-                            {
-                                "units_done": units_done,
-                                "total_units": total_units,
-                                "vaulted_total": vaulted_total,
-                                "symbol": symbol,
-                                "tribe": tribe,
-                                "gen": result.gen + 1,
-                                # next generation's population, so a failed or
-                                # cancelled campaign can resume mid-tribe
-                                "population": (
-                                    [g.to_json() for g in result.next_population]
-                                    if result.next_population
-                                    else None
-                                ),
-                            }
-                        ),
-                    )
+                for t_idx, tribe in enumerate(cfg.tribes):
+                    if s_idx == sym_start and tf_idx == tf_start and t_idx < tribe_start:
+                        continue
+                    is_resumed_tribe = resuming and s_idx == sym_start and tf_idx == tf_start and t_idx == tribe_start
                     _wait_while_paused(should_pause, should_stop, emit)
                     if should_stop():
                         raise _Cancelled()
+                    emit({"type": "log", "line": f"breeding tribe '{tribe}' on {symbol}"})
+                    seed = (cfg.seed if cfg.seed is not None else int(time.time())) + t_idx * 1000
+                    initial = None
+                    if is_resumed_tribe:
+                        initial = resume_pop
+                    elif seed_genome is not None and tribe == seed_tribe:
+                        initial = _seed_population(
+                            seed_genome, cfg.population, np.random.default_rng(seed)
+                        )
+                    for result in evolve_tribe(
+                        tribe,
+                        bars_breed,
+                        bars_select,
+                        costs,
+                        ga,
+                        fit_cfg,
+                        gate,
+                        seed=seed,
+                        bars_per_year=BARS_PER_YEAR[timeframe],
+                        initial=resume_pop if is_resumed_tribe else None,
+                        start_gen=resume_gen if is_resumed_tribe else 0,
+                        already_vaulted=(
+                            vault.campaign_tribe_genomes(campaign_id, symbol, tribe)
+                            if is_resumed_tribe
+                            else None
+                        ),
+                    ):
+                        for genome, is_m, oos_m in result.vaulted:
+                            from alglory.backtest.engine import run_backtest
+
+                            oos_equity = run_backtest(genome, bars_select, costs).equity
+                            sid = vault.add_strategy(
+                                name=None,
+                                tribe=tribe,
+                                symbol=symbol,
+                                timeframe=timeframe,
+                                genome_json=genome.to_json(),
+                                is_metrics=is_m.to_dict(),
+                                oos_metrics=oos_m.to_dict(),
+                                equity=oos_equity,
+                                campaign_id=campaign_id,
+                            )
+                            # score walk-forward robustness at insert so the vault
+                            # ranks new strategies without a manual rescore. Scored
+                            # on the full series; best-effort — never break vaulting.
+                            grade = None
+                            try:
+                                from alglory.analysis.robustness import robustness
+
+                                r = robustness(
+                                    genome, bars, costs,
+                                    BARS_PER_YEAR[timeframe], timeframe=timeframe,
+                                )
+                                vault.set_robustness(sid, r["grade"], r["score"])
+                                grade = r["grade"]
+                            except Exception as exc:  # noqa: BLE001 - scoring must not abort a campaign
+                                emit({"type": "log", "line": f"robustness scoring failed for strategy {sid}: {exc}"})
+                            vaulted_total += 1
+                            row = vault.get_strategy(sid)
+                            emit(
+                                {
+                                    "type": "strategy_vaulted",
+                                    "strategy_id": sid,
+                                    "name": row["name"],
+                                    "tribe": tribe,
+                                    "symbol": symbol,
+                                    "timeframe": timeframe,
+                                    "oos_net_profit": oos_m.net_profit,
+                                    "robustness_grade": grade,
+                                }
+                            )
+
+                        order = sorted(
+                            range(len(result.evaluated)),
+                            key=lambda i: result.evaluated[i].fit,
+                            reverse=True,
+                        )
+                        top_equity = []
+                        for i in order[:TOP_CURVES]:
+                            ev = result.evaluated[i]
+                            if ev.fit <= 0:
+                                continue
+                            from alglory.backtest.engine import run_backtest
+
+                            eq = run_backtest(ev.genome, bars_breed, costs).equity
+                            top_equity.append(
+                                {"id": f"G{result.gen}-{i}", "points": _downsample(eq)}
+                            )
+
+                        units_done += 1
+                        emit(
+                            {
+                                "type": "generation",
+                                "campaign_id": campaign_id,
+                                "symbol": symbol,
+                                "timeframe": timeframe,
+                                "tribe": tribe,
+                                "gen": result.gen + 1,
+                                "of": cfg.generations,
+                                "top_fitness": result.top.fit,
+                                "survivors": result.survivors,
+                                "culled": result.culled,
+                                "population": len(result.evaluated),
+                                "top_equity": top_equity,
+                                "vaulted_count_total": vaulted_total,
+                                "units_done": units_done,
+                                "total_units": total_units,
+                            }
+                        )
+                        vault.update_campaign(
+                            campaign_id,
+                            progress_json=json.dumps(
+                                {
+                                    "units_done": units_done,
+                                    "total_units": total_units,
+                                    "vaulted_total": vaulted_total,
+                                    "symbol": symbol,
+                                    "timeframe": timeframe,
+                                    "tribe": tribe,
+                                    "gen": result.gen + 1,
+                                    # next generation's population, so a failed or
+                                    # cancelled campaign can resume mid-tribe
+                                    "population": (
+                                        [g.to_json() for g in result.next_population]
+                                        if result.next_population
+                                        else None
+                                    ),
+                                }
+                            ),
+                        )
+                        _wait_while_paused(should_pause, should_stop, emit)
+                        if should_stop():
+                            raise _Cancelled()
     except _Cancelled:
         status, error = "cancelled", None
         emit({"type": "log", "line": "campaign cancelled by user"})
