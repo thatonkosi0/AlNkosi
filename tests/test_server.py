@@ -182,14 +182,14 @@ def test_campaign_get_by_id(app_client):
     assert client.get("/api/campaigns/424242").status_code == 404
 
 
-def test_campaign_accepts_commission(app_client):
+def test_campaign_accepts_cost_overrides(app_client):
     client, fake, cfg = app_client
     payload = {
         "symbols": ["EURUSD"], "tribes": ["trend"], "population": 8,
-        "generations": 2, "commission_per_lot": 0.00007,
+        "generations": 2, "cost_overrides": {"EURUSD": {"commission_per_lot": 3.0}},
     }
     assert client.post("/api/campaigns", json=payload).status_code == 202
-    assert fake.started_with.commission_per_lot == pytest.approx(0.00007)
+    assert fake.started_with.cost_overrides == {"EURUSD": {"commission_per_lot": 3.0}}
 
 
 def test_vault_list_get_delete(app_client):

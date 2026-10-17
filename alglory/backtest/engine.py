@@ -31,12 +31,12 @@ ATR_PERIOD = 14
 
 @dataclass(frozen=True)
 class Costs:
-    spread: float
-    commission_per_lot: float = 0.0
+    spread: float  # price units
+    commission: float = 0.0  # price units (convert money/lot first)
 
     @property
     def round_trip(self) -> float:
-        return self.spread + self.commission_per_lot
+        return self.spread + self.commission
 
 
 def effective_spread(bars: pd.DataFrame, floor: float = 0.0) -> float:

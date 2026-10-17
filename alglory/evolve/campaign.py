@@ -13,12 +13,14 @@ import traceback
 from typing import Callable
 
 import numpy as np
+import pandas as pd
 from pydantic import BaseModel, Field, field_validator
 
 from alglory.backtest.engine import Costs, effective_spread
 from alglory.validation import validate_symbol
 from alglory.data.cache import BarCache, check_sufficiency
 from alglory.data.sample import generate_bars
+from alglory.evolve.costs import commission_price, resolve_profile
 from alglory.evolve.fitness import FitnessConfig, OOSGate
 from alglory.evolve.ga import GAParams, evolve_tribe
 from alglory.genome import TRIBES, Genome, mutate
@@ -26,6 +28,7 @@ from alglory.vault.db import Vault
 
 SAMPLE_BARS = 6000
 MIN_BARS = 1500
+HISTORY_BARS = 50_000
 EQUITY_POINTS = 200
 TOP_CURVES = 5
 BARS_PER_YEAR = {"M15": 24960.0, "H1": 6240.0, "H4": 1560.0, "D1": 260.0}
@@ -42,10 +45,9 @@ class CampaignConfig(BaseModel):
     source: str = "sample"
     min_trades: int = Field(default=30, ge=1)
     dd_cap: float = Field(default=0.35, gt=0.0, le=1.0)
-    commission_per_lot: float = Field(default=0.0, ge=0.0)
-    # Backtest spread is never charged below this many pips (MT5 source),
-    # nor below the broker's live spread; history alone under-reports it.
-    min_spread_pips: float = Field(default=1.0, ge=0.0)
+    # Per-symbol overrides of the market cost profile:
+    # {"XAUUSD": {"min_spread": 0.4, "commission_per_lot": 0.0}}
+    cost_overrides: dict[str, dict[str, float]] = Field(default_factory=dict)
     # Retrain/optimize: seed the population from this vaulted strategy's
     # genome (plus mutants of it) instead of starting from random genomes.
     seed_strategy_id: int | None = None
@@ -85,34 +87,40 @@ def _downsample(equity: np.ndarray, n: int = EQUITY_POINTS) -> list[float]:
     return [float(x) for x in equity[idx]]
 
 
-def _spread_floor(min_spread_pips: float, tick_size: float, broker_spread: float) -> float:
-    """Lowest spread (price units) a backtest may charge for one symbol.
-
-    A pip is 10 ticks on fractional-pip quotes (EURUSD 0.0001, USDJPY 0.01),
-    so the floor scales with the symbol instead of being one fixed price.
-    """
-    return max(min_spread_pips * 10 * tick_size, broker_spread)
-
-
-def _load_bars(cfg: CampaignConfig, symbol: str, cache: BarCache, emit):
-    """Return (bars, spread_floor) for one symbol."""
+def _load_bars(
+    cfg: CampaignConfig, symbol: str, timeframe: str, cache: BarCache, emit
+) -> tuple[pd.DataFrame, Costs]:
+    """Return (bars, costs) for one symbol; costs are in price units."""
     if cfg.source == "sample":
-        emit({"type": "log", "line": f"generating sample data for {symbol} {cfg.timeframe}"})
+        emit({"type": "log", "line": f"generating sample data for {symbol} {timeframe}"})
+        bars = generate_bars(symbol, timeframe, SAMPLE_BARS, seed=cfg.seed or 7)
         # synthetic bars carry a realistic spread on every bar; no floor needed
-        return generate_bars(symbol, cfg.timeframe, SAMPLE_BARS, seed=cfg.seed or 7), 0.0
+        return bars, Costs(spread=effective_spread(bars), commission=0.0)
     from alglory.data.mt5source import MT5Source
 
     src = MT5Source()
     status = src.connect()
     if not status.ok:
         raise RuntimeError(status.message)
-    emit({"type": "log", "line": f"downloading {symbol} {cfg.timeframe} history from MT5 ({status.account})"})
-    bars = src.fetch_bars(symbol, cfg.timeframe, 20000)
-    cache.save(symbol, cfg.timeframe, bars)
-    floor = _spread_floor(
-        cfg.min_spread_pips, src.symbol_spec(symbol).tick_size, src.symbol_spread(symbol)
-    )
-    return bars, floor
+    emit({"type": "log", "line": f"downloading {symbol} {timeframe} history from MT5 ({status.account})"})
+    count = HISTORY_BARS
+    while True:
+        try:
+            bars = src.fetch_bars(symbol, timeframe, count)
+            if bars is None or len(bars) == 0:
+                raise RuntimeError(f"MT5 returned no {symbol} {timeframe} bars")
+            break
+        except Exception as exc:
+            if count // 2 < MIN_BARS:
+                raise
+            count //= 2
+            emit({"type": "log", "line": f"{symbol} {timeframe}: fetch failed ({exc}); retrying with {count} bars"})
+    cache.save(symbol, timeframe, bars)
+    profile = resolve_profile(cfg, symbol)
+    spread = effective_spread(bars, floor=max(profile.min_spread, src.symbol_spread(symbol)))
+    commission = commission_price(profile.commission_per_lot, src.symbol_spec(symbol))
+    emit({"type": "log", "line": f"{symbol}: costs spread {spread:.6g} + commission {commission:.6g} (price units)"})
+    return bars, Costs(spread=spread, commission=commission)
 
 
 def _wait_while_paused(
@@ -237,15 +245,11 @@ def run_campaign(
         for s_idx, symbol in enumerate(cfg.symbols):
             if s_idx < sym_start:
                 continue
-            bars, spread_floor = _load_bars(cfg, symbol, cache, emit)
+            bars, costs = _load_bars(cfg, symbol, cfg.timeframe, cache, emit)
             check_sufficiency(bars, MIN_BARS)
             split = int(len(bars) * (1.0 - cfg.oos_fraction))
             bars_is = bars.iloc[:split].reset_index(drop=True)
             bars_oos = bars.iloc[split:].reset_index(drop=True)
-            costs = Costs(
-                spread=effective_spread(bars, floor=spread_floor),
-                commission_per_lot=cfg.commission_per_lot,
-            )
             emit(
                 {
                     "type": "log",

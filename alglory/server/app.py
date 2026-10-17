@@ -369,7 +369,7 @@ def create_app(cfg: AppConfig, *, token: str | None = None) -> FastAPI:
         return {"status": "deleted"}
 
     @app.post("/api/vault/rescore")
-    def vault_rescore(symbol: str, timeframe: str, commission_per_lot: float = 0.0):
+    def vault_rescore(symbol: str, timeframe: str, commission: float = 0.0):
         """Recompute + persist walk-forward robustness for a symbol/timeframe so
         the vault can rank by trustworthiness instead of the overfit-prone OOS
         metric. Uses cached bars; may take a while for a large set."""
@@ -385,7 +385,7 @@ def create_app(cfg: AppConfig, *, token: str | None = None) -> FastAPI:
             raise HTTPException(422, str(exc)) from exc
         return rescore_vault(
             vault(), BarCache(cfg.data_dir), symbol, timeframe, BARS_PER_YEAR[timeframe],
-            commission_per_lot=commission_per_lot,
+            commission=commission,
         )
 
     @app.get("/api/insights")

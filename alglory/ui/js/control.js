@@ -133,7 +133,6 @@ export function initControl() {
       oos_fraction: Number(form.get("oos_fraction")),
       min_trades: Number(form.get("min_trades")),
       dd_cap: Number(form.get("dd_cap")),
-      commission_per_lot: Number(form.get("commission_per_lot")) || 0,
     };
     if (form.get("seed")) payload.seed = Number(form.get("seed"));
     if (seedStrategyId != null) payload.seed_strategy_id = seedStrategyId;
