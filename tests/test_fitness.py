@@ -97,3 +97,13 @@ def test_holdout_pass_bar():
     assert holdout_pass(m(**{**ok, "pf": 1.09}), HOLD) is False
     assert holdout_pass(m(**{**ok, "trades": 49}), HOLD) is False
     assert holdout_pass(m(**{**ok, "net": -0.01}), HOLD) is False
+
+
+def test_wr_score_is_zero_at_or_below_45pct():
+    assert fitness(m(wr=0.45), CFG) == pytest.approx(fitness(m(wr=0.40), CFG))
+
+
+def test_wr_score_linear_between_45_and_70pct():
+    lo = fitness(m(wr=0.45), CFG)
+    hi = fitness(m(wr=0.70), CFG)
+    assert fitness(m(wr=0.575), CFG) == pytest.approx((lo + hi) / 2)

@@ -21,7 +21,7 @@ def fitness(m: Metrics, cfg: FitnessConfig) -> float:
         return 0.0
     pf_score = min(m.profit_factor, 3.0) / 3.0
     sharpe_score = min(max(m.sharpe, 0.0), 3.0) / 3.0
-    wr_score = min(max(m.win_rate, 0.0), 0.70) / 0.70
+    wr_score = min(max((m.win_rate - 0.45) / (0.70 - 0.45), 0.0), 1.0)
     score = (
         cfg.pf_weight * pf_score
         + cfg.sharpe_weight * sharpe_score
