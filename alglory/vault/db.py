@@ -29,7 +29,31 @@ _SORTABLE = {f"{p}_{k}" for p in ("is", "oos") for k in _METRIC_KEYS} | {
     "timeframe",
     "robustness_score",
     "robustness_grade",
+    "ho_win_rate",
+    "ho_profit_factor",
+    "ho_trades",
+    "ho_net_profit",
 }
+
+STAGES = ("legacy", "holdout_passed", "on_demo", "demo_passed", "demo_failed")
+
+# Columns added after the first release: (table, column, declaration).
+_MIGRATIONS = (
+    ("strategies", "robustness_grade", "TEXT"),
+    ("strategies", "robustness_score", "REAL"),
+    ("strategies", "stage", "TEXT"),
+    ("strategies", "holdout_json", "TEXT"),
+    ("strategies", "ho_win_rate", "REAL"),
+    ("strategies", "ho_profit_factor", "REAL"),
+    ("strategies", "ho_trades", "REAL"),
+    ("strategies", "ho_net_profit", "REAL"),
+    ("strategies", "holdout_trades_json", "TEXT"),
+    ("strategies", "holdout_reused", "INTEGER DEFAULT 0"),
+    ("strategies", "demo_started_at", "TEXT"),
+    ("strategies", "demo_preset", "TEXT"),
+    ("strategies", "demo_json", "TEXT"),
+    ("campaigns", "holdout_windows_json", "TEXT"),
+)
 
 # Metric-range filters accepted by list_strategies: name -> (column, operator).
 _RANGE_FILTERS = {
@@ -94,10 +118,15 @@ class Vault:
     @staticmethod
     def _migrate(con: sqlite3.Connection) -> None:
         """Add columns introduced after a DB was first created (idempotent)."""
-        existing = {r["name"] for r in con.execute("PRAGMA table_info(strategies)")}
-        for col, decl in (("robustness_grade", "TEXT"), ("robustness_score", "REAL")):
-            if col not in existing:
-                con.execute(f"ALTER TABLE strategies ADD COLUMN {col} {decl}")
+        existing: dict[str, set[str]] = {}
+        for table, col, decl in _MIGRATIONS:
+            if table not in existing:
+                existing[table] = {
+                    r["name"] for r in con.execute(f"PRAGMA table_info({table})")
+                }
+            if col not in existing[table]:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        con.execute("UPDATE strategies SET stage = 'legacy' WHERE stage IS NULL")
 
     def _conn(self) -> sqlite3.Connection:
         con = sqlite3.connect(self._path, timeout=30)
@@ -119,11 +148,25 @@ class Vault:
         oos_metrics: dict,
         equity: np.ndarray,
         campaign_id: int | None,
+        stage: str = "legacy",
+        holdout_metrics: dict | None = None,
+        holdout_trades: list[dict] | None = None,
+        holdout_reused: bool = False,
     ) -> int:
+        if stage not in STAGES:
+            raise ValueError(f"Unknown stage {stage!r}; allowed: {list(STAGES)}")
+        ho = holdout_metrics or {}
         cols = ["name", "tribe", "symbol", "timeframe", "genome_json", "is_json",
-                "oos_json", "equity_blob", "campaign_id"]
+                "oos_json", "equity_blob", "campaign_id", "stage", "holdout_json",
+                "holdout_trades_json", "holdout_reused"]
         vals = [name, tribe, symbol, timeframe, genome_json, json.dumps(is_metrics),
-                json.dumps(oos_metrics), _pack_equity(equity), campaign_id]
+                json.dumps(oos_metrics), _pack_equity(equity), campaign_id, stage,
+                json.dumps(holdout_metrics) if holdout_metrics is not None else None,
+                json.dumps(holdout_trades) if holdout_trades is not None else None,
+                int(bool(holdout_reused))]
+        for key in ("win_rate", "profit_factor", "trades", "net_profit"):
+            cols.append(f"ho_{key}")
+            vals.append(ho.get(key))
         for prefix, metrics in (("is", is_metrics), ("oos", oos_metrics)):
             for key in _METRIC_KEYS:
                 cols.append(f"{prefix}_{key}")
@@ -149,6 +192,8 @@ class Vault:
         sort: str = "oos_net_profit",
         desc: bool = True,
         limit: int = 200,
+        stage: str | None = None,
+        include_legacy: bool = True,
         **ranges: float | None,
     ) -> list[dict]:
         if sort not in _SORTABLE:
@@ -163,6 +208,11 @@ class Vault:
             if val is not None:
                 where.append(f"{col} = ?")
                 params.append(val)
+        if stage is not None:
+            where.append("stage = ?")
+            params.append(stage)
+        if not include_legacy:
+            where.append("stage != 'legacy'")
         for name, val in ranges.items():
             if val is not None:
                 col, op = _RANGE_FILTERS[name]
@@ -176,7 +226,8 @@ class Vault:
         with self._conn() as con:
             rows = con.execute(
                 f"SELECT id, name, tribe, symbol, timeframe, campaign_id, created_at, "
-                f"robustness_grade, robustness_score, "
+                f"robustness_grade, robustness_score, stage, holdout_reused, "
+                f"ho_win_rate, ho_profit_factor, ho_trades, ho_net_profit, "
                 f"{sortable_cols} FROM strategies {clause} "
                 f"ORDER BY {sort} {order} LIMIT ?",
                 (*params, limit),
@@ -190,6 +241,29 @@ class Vault:
                 (grade, None if score is None else float(score), sid),
             )
 
+    def set_stage(
+        self,
+        sid: int,
+        stage: str,
+        *,
+        demo_started_at: str | None = None,
+        demo_preset: str | None = None,
+        demo_json: dict | None = None,
+    ) -> None:
+        if stage not in STAGES:
+            raise ValueError(f"Unknown stage {stage!r}; allowed: {list(STAGES)}")
+        sets, params = ["stage = ?"], [stage]
+        for col, val in (
+            ("demo_started_at", demo_started_at),
+            ("demo_preset", demo_preset),
+            ("demo_json", None if demo_json is None else json.dumps(demo_json)),
+        ):
+            if val is not None:
+                sets.append(f"{col} = ?")
+                params.append(val)
+        with self._conn() as con:
+            con.execute(f"UPDATE strategies SET {', '.join(sets)} WHERE id = ?", (*params, sid))
+
     def get_strategy(self, sid: int) -> dict | None:
         with self._conn() as con:
             row = con.execute("SELECT * FROM strategies WHERE id = ?", (sid,)).fetchone()
@@ -200,6 +274,8 @@ class Vault:
         d["oos_metrics"] = json.loads(d.pop("oos_json"))
         blob = d.pop("equity_blob")
         d["equity"] = _unpack_equity(blob) if blob else []
+        d["holdout_trades"] = json.loads(d["holdout_trades_json"] or "[]")
+        d["demo"] = json.loads(d["demo_json"] or "{}")
         return d
 
     def campaign_tribe_genomes(self, campaign_id: int, symbol: str, tribe: str) -> set[str]:
@@ -244,6 +320,30 @@ class Vault:
             con.execute(
                 f"UPDATE campaigns SET {', '.join(sets)} WHERE id = ?", (*params, cid)
             )
+
+    def set_holdout_windows(self, cid: int, windows: list[dict]) -> None:
+        with self._conn() as con:
+            con.execute(
+                "UPDATE campaigns SET holdout_windows_json = ? WHERE id = ?",
+                (json.dumps(windows), cid),
+            )
+
+    def consumed_holdout_windows(
+        self, symbol: str, timeframe: str, exclude_campaign: int | None = None
+    ) -> list[dict]:
+        with self._conn() as con:
+            rows = con.execute(
+                "SELECT id, holdout_windows_json FROM campaigns "
+                "WHERE holdout_windows_json IS NOT NULL ORDER BY id"
+            ).fetchall()
+        out = []
+        for r in rows:
+            if exclude_campaign is not None and r["id"] == exclude_campaign:
+                continue
+            for w in json.loads(r["holdout_windows_json"]):
+                if w.get("symbol") == symbol and w.get("timeframe") == timeframe:
+                    out.append(w)
+        return out
 
     def get_campaign(self, cid: int) -> dict | None:
         with self._conn() as con:
