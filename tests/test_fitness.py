@@ -107,3 +107,10 @@ def test_wr_score_linear_between_45_and_70pct():
     lo = fitness(m(wr=0.45), CFG)
     hi = fitness(m(wr=0.70), CFG)
     assert fitness(m(wr=0.575), CFG) == pytest.approx((lo + hi) / 2)
+
+
+def test_holdout_pass_applies_max_dd():
+    ok = dict(wr=0.61, pf=1.2, trades=50, net=0.02)
+    assert holdout_pass(m(**{**ok, "dd": 0.40}), HoldoutGate(max_dd=0.35)) is False
+    assert holdout_pass(m(**{**ok, "dd": 0.35}), HoldoutGate(max_dd=0.35)) is True
+    assert HoldoutGate().max_dd == 0.35  # FitnessConfig's default dd_cap

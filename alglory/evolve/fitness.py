@@ -56,6 +56,8 @@ class HoldoutGate:
     min_win_rate: float = 0.60
     min_pf: float = 1.1
     min_trades: int = 50
+    # the campaign's dd_cap: applies under every preset, personal included
+    max_dd: float = 0.35
 
 
 def holdout_pass(m: Metrics, gate: HoldoutGate) -> bool:
@@ -64,4 +66,5 @@ def holdout_pass(m: Metrics, gate: HoldoutGate) -> bool:
         and m.win_rate > gate.min_win_rate
         and m.profit_factor >= gate.min_pf
         and m.trades >= gate.min_trades
+        and m.max_drawdown <= gate.max_dd
     )

@@ -787,3 +787,30 @@ def test_resume_when_market_skips_counts_units_once_and_names_error(
     assert final["units_done"] == final["total_units"]
     assert final["holdout_done"] == ["EURUSD"]
     assert final["finalists"] == {}
+
+
+def test_config_rejects_split_fractions_summing_to_point_nine():
+    with pytest.raises(ValidationError, match="select_fraction \+ holdout_fraction"):
+        CampaignConfig(symbols=["EURUSD"], tribes=["trend"],
+                       select_fraction=0.45, holdout_fraction=0.45)
+    with pytest.raises(ValidationError, match="must be below 0.9"):
+        CampaignConfig(symbols=["EURUSD"], tribes=["trend"],
+                       select_fraction=0.5, holdout_fraction=0.5)
+    ok = CampaignConfig(symbols=["EURUSD"], tribes=["trend"],
+                        select_fraction=0.4, holdout_fraction=0.4)
+    assert ok.select_fraction + ok.holdout_fraction < 0.9
+
+
+def test_holdout_gate_carries_dd_cap(vault, cache, monkeypatch):
+    _force_finalists(monkeypatch)
+    gates = []
+
+    def judge(f, holdout_bars, costs, gate, preset, bars_per_year):
+        gates.append((gate, preset))
+        m = Metrics(net_profit=0.1, max_drawdown=0.05, profit_factor=1.5, sharpe=1.0,
+                    win_rate=0.7, trades=60, avg_yearly_return=0.1)
+        return HoldoutResult(finalist=f, metrics=m, passed=False, reasons=["x"])
+
+    monkeypatch.setattr(campaign_mod, "judge_finalist", judge)
+    _run(dict(TINY, dd_cap=0.22), vault, cache)
+    assert gates and all(g.max_dd == 0.22 and p is None for g, p in gates)

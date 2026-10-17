@@ -82,6 +82,8 @@ def _gate_reasons(m: Metrics, gate: HoldoutGate) -> list[str]:
         out.append(f"profit factor {m.profit_factor:.2f} below {gate.min_pf}")
     if not m.trades >= gate.min_trades:
         out.append(f"{m.trades} trades below {gate.min_trades}")
+    if not m.max_drawdown <= gate.max_dd:
+        out.append(f"max drawdown {m.max_drawdown:.0%} > dd_cap {gate.max_dd:.0%}")
     return out
 
 

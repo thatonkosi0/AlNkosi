@@ -92,6 +92,18 @@ class CampaignConfig(BaseModel):
                 data.setdefault("select_fraction", frac)
         return data
 
+    @model_validator(mode="after")
+    def _split_fits(self):
+        # checked here, not per market: inside the run it would be caught as
+        # "not available from broker" and the campaign would finish empty
+        if self.select_fraction + self.holdout_fraction >= 0.9:
+            raise ValueError(
+                f"select_fraction + holdout_fraction must be below 0.9 (got "
+                f"{self.select_fraction} + {self.holdout_fraction}); leave at least "
+                f"10% of the history for breeding"
+            )
+        return self
+
     @field_validator("timeframes")
     @classmethod
     def _tfs(cls, v):
@@ -272,7 +284,7 @@ def _holdout_stage(
     if not finalists:
         emit({"type": "log", "line": f"{symbol}: no finalists reached the holdout"})
         return 0
-    gate = HoldoutGate(min_trades=cfg.min_holdout_trades)
+    gate = HoldoutGate(min_trades=cfg.min_holdout_trades, max_dd=cfg.dd_cap)
     preset = None if cfg.target_preset == "personal" else GUARDRAIL_PRESETS[cfg.target_preset]
 
     # An earlier run already recorded this market's windows, so it crashed

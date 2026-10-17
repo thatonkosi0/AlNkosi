@@ -147,3 +147,18 @@ def test_keep_best_caps_and_orders():
 def test_holdout_gate_thresholds_pinned():
     g = HoldoutGate()
     assert (g.min_win_rate, g.min_pf, g.min_trades) == (0.60, 1.1, 50)
+
+
+def test_judge_enforces_dd_cap_under_personal(monkeypatch):
+    g = _genome()
+    r = g.risk.risk_pct
+    # 20 straight -1R losses (deep drawdown) then enough wins to pass the rest
+    pnls = [(i, -r) for i in range(1, 21)] + [(i, 2 * r) for i in range(21, 121)]
+    _patch_backtest(monkeypatch, _result(pnls))
+    f = _finalist(g)
+    res = judge_finalist(f, _bars(130), COSTS, HoldoutGate(max_dd=0.01), None, 6240.0)
+    assert res.metrics.max_drawdown > 0.01
+    assert res.passed is False
+    assert any(x.startswith("max drawdown") and "> dd_cap 1%" in x for x in res.reasons)
+    loose = judge_finalist(f, _bars(130), COSTS, HoldoutGate(max_dd=0.99), None, 6240.0)
+    assert loose.passed is True and loose.reasons == []
