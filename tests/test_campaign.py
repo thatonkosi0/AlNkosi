@@ -814,3 +814,34 @@ def test_holdout_gate_carries_dd_cap(vault, cache, monkeypatch):
     monkeypatch.setattr(campaign_mod, "judge_finalist", judge)
     _run(dict(TINY, dd_cap=0.22), vault, cache)
     assert gates and all(g.max_dd == 0.22 and p is None for g, p in gates)
+
+
+def test_sample_window_does_not_flag_mt5_holdout_as_reused(vault, cache, monkeypatch):
+    from alglory.backtest.engine import Costs, effective_spread
+    from alglory.data.sample import generate_bars
+
+    _force_finalists(monkeypatch)
+    _fake_judge(monkeypatch)
+    sample = _run(TINY, vault, cache)
+    sample_ids = {r["id"] for r in vault.list_strategies(limit=500)}
+    assert sample_ids
+
+    def load(cfg_, symbol, timeframe, cache_, emit):  # "MT5" bars on the same dates
+        bars = generate_bars(symbol, timeframe, campaign_mod.SAMPLE_BARS, seed=42)
+        return bars, Costs(spread=effective_spread(bars), commission=0.0)
+
+    monkeypatch.setattr(campaign_mod, "_load_bars", load)
+    first_mt5 = _run(dict(TINY, source="mt5"), vault, cache)
+    w = json.loads(vault.get_campaign(first_mt5[0]["campaign_id"])["holdout_windows_json"])
+    assert [x["source"] for x in w] == ["mt5"]
+    assert w[0]["start"] == json.loads(
+        vault.get_campaign(sample[0]["campaign_id"])["holdout_windows_json"])[0]["start"]
+    mt5_rows = [r for r in vault.list_strategies(limit=500) if r["id"] not in sample_ids]
+    assert mt5_rows and all(r["holdout_reused"] == 0 for r in mt5_rows)
+    assert not any("holdout reused" in line for line in _logs(first_mt5))
+
+    seen = sample_ids | {r["id"] for r in mt5_rows}
+    second_mt5 = _run(dict(TINY, source="mt5"), vault, cache)
+    again = [r for r in vault.list_strategies(limit=500) if r["id"] not in seen]
+    assert again and all(r["holdout_reused"] == 1 for r in again)
+    assert any("holdout reused" in line for line in _logs(second_mt5))

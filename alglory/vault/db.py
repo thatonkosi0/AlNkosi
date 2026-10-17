@@ -107,6 +107,16 @@ def _unpack_equity(blob: bytes) -> list[float]:
     return [float(x) for x in arr]
 
 
+
+def _window_source(window: dict, config_json: str | None) -> str:
+    if window.get("source"):
+        return window["source"]
+    try:
+        cfg = json.loads(config_json or "{}")
+    except ValueError:
+        cfg = {}
+    return (cfg.get("source") if isinstance(cfg, dict) else None) or "sample"
+
 class Vault:
     def __init__(self, db_path: Path):
         self._path = Path(db_path)
@@ -329,11 +339,19 @@ class Vault:
             )
 
     def consumed_holdout_windows(
-        self, symbol: str, timeframe: str, exclude_campaign: int | None = None
+        self,
+        symbol: str,
+        timeframe: str,
+        exclude_campaign: int | None = None,
+        source: str | None = None,
     ) -> list[dict]:
+        """Holdout windows other campaigns judged on. With ``source``, only
+        windows of that data source count: synthetic sample bars share dates
+        with real history but not its data. A window stored without a source
+        takes its campaign's configured source (default "sample")."""
         with self._conn() as con:
             rows = con.execute(
-                "SELECT id, holdout_windows_json FROM campaigns "
+                "SELECT id, config_json, holdout_windows_json FROM campaigns "
                 "WHERE holdout_windows_json IS NOT NULL ORDER BY id"
             ).fetchall()
         out = []
@@ -341,8 +359,11 @@ class Vault:
             if exclude_campaign is not None and r["id"] == exclude_campaign:
                 continue
             for w in json.loads(r["holdout_windows_json"]):
-                if w.get("symbol") == symbol and w.get("timeframe") == timeframe:
-                    out.append(w)
+                if w.get("symbol") != symbol or w.get("timeframe") != timeframe:
+                    continue
+                if source is not None and _window_source(w, r["config_json"]) != source:
+                    continue
+                out.append(w)
         return out
 
     def get_campaign(self, cid: int) -> dict | None:

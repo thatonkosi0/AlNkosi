@@ -222,3 +222,21 @@ def test_consumed_holdout_windows(vault):
     assert sorted(x["start"] for x in got) == ["2024-01-01", "2024-03-01"]
     got = vault.consumed_holdout_windows("EURUSD", "H1", exclude_campaign=c1)
     assert [x["start"] for x in got] == ["2024-03-01"]
+
+
+def test_consumed_holdout_windows_filters_by_source(vault):
+    sample = vault.create_campaign('{"source": "sample"}')
+    mt5 = vault.create_campaign('{"source": "mt5"}')
+    legacy_sample = vault.create_campaign("{}")  # pre-source config: CampaignConfig default
+    legacy_mt5 = vault.create_campaign('{"source": "mt5"}')
+    w = lambda a, src=None: {"symbol": "EURUSD", "timeframe": "H4", "start": a, "end": a,  # noqa: E731
+                             **({"source": src} if src else {})}
+    vault.set_holdout_windows(sample, [w("2022-01-01", "sample")])
+    vault.set_holdout_windows(mt5, [w("2023-01-01", "mt5")])
+    vault.set_holdout_windows(legacy_sample, [w("2024-01-01")])
+    vault.set_holdout_windows(legacy_mt5, [w("2025-01-01")])
+    got = lambda src: sorted(x["start"] for x in vault.consumed_holdout_windows(  # noqa: E731
+        "EURUSD", "H4", source=src))
+    assert got("mt5") == ["2023-01-01", "2025-01-01"]
+    assert got("sample") == ["2022-01-01", "2024-01-01"]
+    assert len(vault.consumed_holdout_windows("EURUSD", "H4")) == 4  # no filter

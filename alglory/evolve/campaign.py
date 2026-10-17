@@ -237,13 +237,20 @@ def _resume_state(
     return sym_start, tf_start, tribe_start, start_gen, population
 
 
-def _window(symbol: str, timeframe: str, holdout: pd.DataFrame) -> dict:
+def _window(symbol: str, timeframe: str, holdout: pd.DataFrame, source: str) -> dict:
     return {
         "symbol": symbol,
         "timeframe": timeframe,
         "start": _naive_iso(holdout["time"].iloc[0]),
         "end": _naive_iso(holdout["time"].iloc[-1]),
+        "source": source,
     }
+
+
+def _same_window(a: dict, b: dict) -> bool:
+    """Same window, ignoring the source tag older records lack."""
+    keys = ("symbol", "timeframe", "start", "end")
+    return all(a.get(k) == b.get(k) for k in keys)
 
 
 def _overlaps(a: dict, b: dict) -> bool:
@@ -297,10 +304,12 @@ def _holdout_stage(
     reused: dict[str, bool] = {}
     judged_tfs = [tf for tf in cfg.timeframes if any(f.timeframe == tf for f in finalists)]
     for tf in judged_tfs:
-        w = _window(symbol, tf, tf_data[tf].holdout)
-        prior = vault.consumed_holdout_windows(symbol, tf, exclude_campaign=campaign_id)
+        w = _window(symbol, tf, tf_data[tf].holdout, cfg.source)
+        prior = vault.consumed_holdout_windows(
+            symbol, tf, exclude_campaign=campaign_id, source=cfg.source
+        )
         reused[tf] = cfg.seed_strategy_id is not None or any(_overlaps(w, p) for p in prior)
-        if w not in campaign_windows:
+        if not any(_same_window(w, c) for c in campaign_windows):
             campaign_windows.append(w)
     vault.set_holdout_windows(campaign_id, campaign_windows)
 
