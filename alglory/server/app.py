@@ -372,26 +372,33 @@ def create_app(cfg: AppConfig, *, token: str | None = None) -> FastAPI:
             return {"strategies": [], "account": {
                 "worst_day_loss": 0.0, "max_drawdown": 0.0, "breaches": []}}
         deals = src.deals_since(min(starts.values()))
-        acct_metrics, day_loss = account_prop(deals, src.account().balance)
+        balance = src.account().balance
+        acct_metrics, _ = account_prop(deals, balance)
 
         acct_breaches: list[str] = []
         out, updates = [], []
         for r in rows:
-            preset = r["demo_preset"] if r["demo_preset"] in GUARDRAIL_PRESETS else "personal"
-            guard = GUARDRAIL_PRESETS[preset]
             mine = deals[deals["time"] >= starts[r["id"]]]
             magic = _EXECUTOR_MAGIC_BASE + r["id"]
             stats = demo_stats(mine, magic)
-            closed = mine[(mine["magic"] == magic) & (mine["entry"] == "out")]
-            closed_days = set(closed["time"].dt.date) if len(closed) else set()
-            breached = (
-                any(day_loss.get(d, 0.0) > guard.daily_loss_pct for d in closed_days)
-                or acct_metrics.max_drawdown > guard.max_dd_pct
-            )
-            for msg in breaches(acct_metrics, guard):
-                if msg not in acct_breaches:
-                    acct_breaches.append(msg)
-            stage, note = decide_stage(stats, starts[r["id"]], now, breached)
+            if r["demo_preset"] not in GUARDRAIL_PRESETS:
+                # no limits to judge against: neither pass nor (permanently) fail
+                stage, note = "on_demo", "unknown preset — re-arm"
+            else:
+                guard = GUARDRAIL_PRESETS[r["demo_preset"]]
+                # measured from this strategy's own start: a drawdown that
+                # happened before it was armed is not its doing
+                own_metrics, own_day_loss = account_prop(mine, balance)
+                closed = mine[(mine["magic"] == magic) & (mine["entry"] == "out")]
+                closed_days = set(closed["time"].dt.date) if len(closed) else set()
+                breached = bool(closed_days) and (
+                    any(own_day_loss.get(d, 0.0) > guard.daily_loss_pct for d in closed_days)
+                    or own_metrics.max_drawdown > guard.max_dd_pct
+                )
+                for msg in breaches(acct_metrics, guard):
+                    if msg not in acct_breaches:
+                        acct_breaches.append(msg)
+                stage, note = decide_stage(stats, starts[r["id"]], now, breached)
             updates.append((r["id"], stage, {**stats, "note": note}))
             out.append({
                 "id": r["id"], "name": r["name"], "stage": stage, "note": note,

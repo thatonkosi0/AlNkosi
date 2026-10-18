@@ -720,3 +720,68 @@ def test_demo_refresh_breach_fails_strategy(app_client):
     assert s["stage"] == "demo_failed"
     assert s["note"] == "prop limit breached"
     assert body["account"]["breaches"]
+
+
+def _deal(t, magic, entry, profit):
+    return {"time": t, "magic": magic, "entry": entry, "profit": profit,
+            "commission": 0.0, "swap": 0.0}
+
+
+def test_demo_refresh_drawdown_fails_only_strategies_that_traded_in_it(app_client):
+    client, _, cfg = app_client
+    loser, late, idle, same_day, later = (
+        _seed_staged(cfg, records=_losing_records()) for _ in range(5))
+    for sid in (loser, idle, same_day, later):
+        _set_on_demo(cfg, sid, 5, preset="prop_conservative")
+    _set_on_demo(cfg, late, 2, preset="prop_conservative")  # armed after the drawdown
+    now = datetime.now(UTC)
+    hit = now - timedelta(days=4)
+    m = lambda sid: 990_000 + sid  # noqa: E731
+    deals = pd.DataFrame([
+        # a 9% account drawdown 4 days ago, from loser (over 8% dd and 3% daily)
+        _deal(hit, m(loser), "in", 0.0),
+        _deal(hit + timedelta(minutes=5), m(loser), "out", -900.0),
+        # same_day closed a small winner on that breach day
+        _deal(hit + timedelta(minutes=10), m(same_day), "in", 0.0),
+        _deal(hit + timedelta(minutes=20), m(same_day), "out", 5.0),
+        # later traded only after the breach day, inside its own drawdown window
+        _deal(now - timedelta(days=3), m(later), "in", 0.0),
+        _deal(now - timedelta(days=3, minutes=-10), m(later), "out", 5.0),
+        # late only traded after its own start: no drawdown since then
+        *[d for i in range(3) for d in (
+            _deal(now - timedelta(hours=10 - i), m(late), "in", 0.0),
+            _deal(now - timedelta(hours=10 - i, minutes=-30), m(late), "out", 10.0))],
+    ])
+    balance = 10_000.0 - 900.0 + 5.0 + 5.0 + 30.0
+    client.app.state.demo_source_factory = lambda: _DealsSource(deals, balance=balance)
+    body = client.post("/api/demo/refresh").json()
+    by_id = {s["id"]: s for s in body["strategies"]}
+    assert by_id[loser]["stage"] == "demo_failed"
+    assert by_id[same_day]["stage"] == "demo_failed"  # traded on a breach day
+    assert by_id[later]["stage"] == "demo_failed"  # traded inside its own 9% drawdown
+    assert by_id[late]["stage"] == "on_demo"  # armed after the drawdown
+    assert by_id[idle]["stage"] == "on_demo"  # no closed deals: nothing to blame
+    v = Vault(cfg.db_path)
+    assert v.get_strategy(late)["stage"] == "on_demo"
+    assert v.get_strategy(idle)["stage"] == "on_demo"
+
+
+@pytest.mark.parametrize("preset", [None, "bogus"])
+def test_demo_refresh_unknown_preset_stays_on_demo(app_client, preset):
+    client, _, cfg = app_client
+    a = _seed_staged(cfg, records=_losing_records())
+    started = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+    v = Vault(cfg.db_path)
+    v.set_stage(a, "on_demo", demo_started_at=started, demo_preset=preset)
+    now = datetime.now(UTC)
+    # good enough to pass, and a 50% loss day: neither decides an unknown preset
+    deals = pd.DataFrame(_deals_for(990_000 + a, 25, 0, now - timedelta(days=2)) + [
+        _deal(now - timedelta(hours=1), 990_000 + a, "in", 0.0),
+        _deal(now - timedelta(minutes=30), 990_000 + a, "out", -5_000.0)])
+    client.app.state.demo_source_factory = lambda: _DealsSource(deals, balance=5_250.0)
+    s = client.post("/api/demo/refresh").json()["strategies"][0]
+    assert s["stage"] == "on_demo"
+    assert s["note"] == "unknown preset — re-arm"
+    row = v.get_strategy(a)
+    assert row["stage"] == "on_demo"
+    assert row["demo"]["note"] == "unknown preset — re-arm"
