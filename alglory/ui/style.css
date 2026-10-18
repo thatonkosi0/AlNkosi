@@ -130,7 +130,7 @@ main { padding: 14px; max-width: 1500px; margin: 0 auto; }
 .gene-filter { color: #3e9de8; border-color: #3e9de8; }
 .gene-mgmt { color: #e8b53e; border-color: #e8b53e; }
 .gene-risk { color: #3ee87e; border-color: #3ee87e; }
-.metric-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0; }
+.metric-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin: 10px 0; }
 .metric-cols h4 { color: var(--text-dim); margin: 4px 0; letter-spacing: 1px; }
 .metric-cols table { width: 100%; font-size: 11px; }
 .metric-cols td { padding: 2px 4px; }

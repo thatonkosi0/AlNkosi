@@ -132,11 +132,14 @@
           <option value="momentum">MOMENTUM</option>
         </select>
         <select id="vf-sort">
+          <option value="ho_win_rate" selected>HOLDOUT WIN%</option>
+          <option value="ho_profit_factor">HOLDOUT PF</option>
+          <option value="ho_net_profit">HOLDOUT PROFIT</option>
           <option value="robustness_score">ROBUSTNESS ★</option>
-          <option value="oos_net_profit" selected>OOS PROFIT</option>
-          <option value="oos_profit_factor">OOS PF</option>
-          <option value="oos_sharpe">OOS SHARPE</option>
-          <option value="oos_max_drawdown">OOS DD</option>
+          <option value="oos_net_profit">SELECT PROFIT</option>
+          <option value="oos_profit_factor">SELECT PF</option>
+          <option value="oos_sharpe">SELECT SHARPE</option>
+          <option value="oos_max_drawdown">SELECT DD</option>
           <option value="created_at">NEWEST</option>
         </select>
         <input type="number" id="vf-minprofit" placeholder="MIN PROFIT %" step="1" title="minimum OOS net profit, percent">
@@ -159,7 +162,7 @@
         <thead><tr>
           <th>NAME</th><th>STAGE</th><th>HOLDOUT WIN%</th><th>HOLDOUT PF</th><th>HOLDOUT TRADES</th>
           <th>TRIBE</th><th>SYMBOL</th><th>TF</th>
-          <th>OOS PROFIT</th><th>PF</th><th>DD</th><th>SHARPE</th><th>TRADES</th><th>ROBUST</th>
+          <th title="select slice — used for selection">SELECT PROFIT</th><th>PF</th><th>DD</th><th>SHARPE</th><th>TRADES</th><th>ROBUST</th>
         </tr></thead>
         <tbody></tbody>
       </table>

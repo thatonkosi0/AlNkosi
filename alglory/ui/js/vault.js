@@ -30,11 +30,49 @@ function robustCell(r) {
   return `<span class="${color}" title="walk-forward robustness score">${g}${score}</span>`;
 }
 
+const REUSED_TEXT = "holdout reused — results are weaker evidence";
+
+function reusedMark(r) {
+  return r.holdout_reused
+    ? ` <span class="pill pill-warn" title="${esc(REUSED_TEXT)}">REUSED</span>`
+    : "";
+}
+
 function holdoutCells(r) {
   if (r.stage === "legacy" || r.ho_trades == null || r.ho_win_rate == null) {
     return `<td colspan="3" class="neg" title="never tested on an untouched holdout">legacy — no holdout</td>`;
   }
-  return `<td>${PCT(r.ho_win_rate)}</td><td>${NUM(r.ho_profit_factor)}</td><td>${esc(r.ho_trades)}</td>`;
+  return `<td>${PCT(r.ho_win_rate)}${reusedMark(r)}</td><td>${NUM(r.ho_profit_factor)}</td><td>${esc(r.ho_trades)}</td>`;
+}
+
+function isLegacy(row) {
+  return row.stage === "legacy" || !row.holdout_json;
+}
+
+function holdoutDetail(row) {
+  if (isLegacy(row)) {
+    return `<div><h4>HOLDOUT (untouched data)</h4><p class="neg">legacy — no holdout</p></div>`;
+  }
+  let m = {};
+  try { m = JSON.parse(row.holdout_json) || {}; } catch { m = {}; }
+  const reused = row.holdout_reused
+    ? `<p class="neg">${reusedMark(row)} ${esc(REUSED_TEXT)}</p>` : "";
+  return `<div><h4>HOLDOUT (untouched data)</h4>${reused}<table>
+    <tr><td>WIN RATE</td><td>${m.win_rate == null ? "-" : PCT(m.win_rate)}</td></tr>
+    <tr><td>PROFIT FACTOR</td><td>${NUM(m.profit_factor)}</td></tr>
+    <tr><td>TRADES</td><td>${esc(m.trades ?? "-")}</td></tr>
+    <tr><td>NET PROFIT</td><td class="${cls(m.net_profit ?? 0)}">${m.net_profit == null ? "-" : PCT(m.net_profit)}</td></tr>
+  </table></div>`;
+}
+
+function demoLine(row) {
+  const d = row.demo || {};
+  let text = "";
+  if (d.trades != null) {
+    text += ` demo: ${esc(d.trades)} trades, win ${PCT(d.win_rate || 0)}, net ${(d.net || 0).toFixed(2)} ${esc(d.note)}`;
+  }
+  if (isLegacy(row)) text += ` <span class="neg">legacy — no holdout</span>`;
+  return text;
 }
 
 async function refreshDemo() {
@@ -86,7 +124,7 @@ export async function refreshVault() {
     tr.innerHTML = `
       <td>${esc(r.name)}</td><td>${stageBadge(r.stage)}</td>${holdoutCells(r)}
       <td>${esc(r.tribe)}</td><td>${esc(r.symbol)}</td><td>${esc(r.timeframe)}</td>
-      <td class="${cls(r.oos_net_profit)}">${PCT(r.oos_net_profit)}</td>
+      <td class="${cls(r.oos_net_profit)}" title="select slice — used for selection">${PCT(r.oos_net_profit)}</td>
       <td>${NUM(r.oos_profit_factor)}</td>
       <td>${PCT(r.oos_max_drawdown)}</td>
       <td>${NUM(r.oos_sharpe)}</td>
@@ -158,12 +196,13 @@ async function showDetail(sid) {
   body.innerHTML = `
     <h3 style="color:var(--primary);letter-spacing:2px">${esc(row.name)} — ${esc(row.symbol)} ${esc(row.timeframe)}</h3>
     ${geneTags(genome)}
-    <p>${stageBadge(row.stage)}${row.demo ? ` demo: ${row.demo.trades} trades, win ${PCT(row.demo.win_rate)}, net ${row.demo.net.toFixed(2)} ${esc(row.demo.note)}` : ""}</p>
+    <p>${stageBadge(row.stage)}${reusedMark(row)}${demoLine(row)}</p>
     <div class="metric-cols">
       <div><h4>IN-SAMPLE</h4>${metricsTable(row.is_metrics)}</div>
-      <div><h4>OUT-OF-SAMPLE (forward test)</h4>${metricsTable(row.oos_metrics)}</div>
+      <div><h4>SELECT (used for selection)</h4>${metricsTable(row.oos_metrics)}</div>
+      ${holdoutDetail(row)}
     </div>
-    <h4 style="color:var(--text-dim)">OOS EQUITY</h4>
+    <h4 style="color:var(--text-dim)">SELECT EQUITY (used for selection)</h4>
     <canvas id="detail-spark" height="120"></canvas>
     <div class="control-actions">
       <button class="btn-primary" id="deploy-btn">⇪ DEPLOY TO MT5</button>
