@@ -845,3 +845,87 @@ def test_sample_window_does_not_flag_mt5_holdout_as_reused(vault, cache, monkeyp
     again = [r for r in vault.list_strategies(limit=500) if r["id"] not in seen]
     assert again and all(r["holdout_reused"] == 1 for r in again)
     assert any("holdout reused" in line for line in _logs(second_mt5))
+
+
+def _bars_loader(frames):
+    """_load_bars stand-in serving each call the next slice in ``frames``."""
+    from alglory.backtest.engine import Costs
+
+    served = []
+
+    def load(cfg_, symbol, timeframe, cache_, emit):
+        bars = frames[min(len(served), len(frames) - 1)].reset_index(drop=True)
+        served.append(len(bars))
+        return bars, Costs(spread=0.0001, commission=0.0)
+
+    return load
+
+
+def _spy_judge(monkeypatch):
+    seen = []
+
+    def judge(f, holdout_bars, costs, gate, preset, bars_per_year):
+        seen.append(holdout_bars)
+        m = Metrics(net_profit=0.1, max_drawdown=0.05, profit_factor=1.5, sharpe=1.0,
+                    win_rate=0.7, trades=60, avg_yearly_return=0.1)
+        return HoldoutResult(finalist=f, metrics=m, passed=True, reasons=[],
+                             records=[{"exit_time": "2024-01-01T00:00:00", "r": 1.0}])
+
+    monkeypatch.setattr(campaign_mod, "judge_finalist", judge)
+    return seen
+
+
+def test_resume_judges_original_holdout_window_on_longer_redownload(vault, cache, monkeypatch):
+    from alglory.data.sample import generate_bars
+
+    full = generate_bars("EURUSD", "H1", 8000, seed=1)
+    first_pull = full.iloc[2000:7000]  # a halved pull: 5000 bars
+    _force_finalists(monkeypatch)
+    seen = _spy_judge(monkeypatch)
+    monkeypatch.setattr(campaign_mod, "_load_bars", _bars_loader([first_pull]))
+    first = _run(TINY, vault, cache, stop_after=4)  # cancel after the first tribe
+    assert first[-1]["status"] == "cancelled"
+    cid = first[0]["campaign_id"]
+    rec = _ckpt(vault, cid)["splits"]["EURUSD"]["H1"]
+    t = full["time"]
+    # 5000 bars at 20% / 20%: select from bar 3000, holdout from bar 4000
+    assert rec["select_start"] == t.iloc[5000].isoformat()
+    assert rec["holdout_start"] == t.iloc[6000].isoformat()
+    assert rec["last"] == t.iloc[6999].isoformat()
+    assert rec["holdout_bars"] == 1000
+
+    # the resume gets the full 8000 bars, reaching further back AND forward
+    monkeypatch.setattr(campaign_mod, "_load_bars", _bars_loader([full]))
+    second = _resume(TINY, vault, cache, cid)
+    assert second[-1]["status"] == "done"
+    assert seen
+    for ho in seen:
+        assert ho["time"].iloc[0] == t.iloc[6000]  # the recorded holdout start
+        assert ho["time"].iloc[-1] == t.iloc[6999]  # the recorded last bar
+        assert len(ho) == 1000
+    assert _ckpt(vault, cid)["splits"] == {}  # pruned once judged
+
+
+@pytest.mark.parametrize("window", [slice(5500, 8000), slice(0, 6500)],
+                         ids=["history-starts-after-select", "holdout-shorter"])
+def test_resume_skips_holdout_when_data_changed(vault, cache, monkeypatch, window):
+    from alglory.data.sample import generate_bars
+
+    full = generate_bars("EURUSD", "H1", 8000, seed=1)
+    _force_finalists(monkeypatch)
+    seen = _spy_judge(monkeypatch)
+    monkeypatch.setattr(campaign_mod, "_load_bars", _bars_loader([full.iloc[2000:7000]]))
+    first = _run(TINY, vault, cache, stop_after=4)
+    cid = first[0]["campaign_id"]
+    assert _ckpt(vault, cid)["finalists"]["EURUSD"]
+
+    monkeypatch.setattr(campaign_mod, "_load_bars", _bars_loader([full.iloc[window]]))
+    second = _resume(TINY, vault, cache, cid)
+    assert second[-1]["status"] == "done"
+    logs = _logs(second)
+    assert "EURUSD H1: holdout skipped — data changed since breeding" in logs
+    assert "EURUSD H1: holdout skipped — no data" not in logs
+    assert not seen
+    assert vault.count() == 0
+    final = _ckpt(vault, cid)
+    assert final["units_done"] == final["total_units"]

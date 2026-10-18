@@ -237,6 +237,43 @@ def _resume_state(
     return sym_start, tf_start, tribe_start, start_gen, population
 
 
+def _split_record(bars: pd.DataFrame, select: pd.DataFrame, holdout: pd.DataFrame) -> dict:
+    """The split boundaries a timeframe was bred under, for the checkpoint."""
+    return {
+        "select_start": _naive_iso(select["time"].iloc[0]),
+        "holdout_start": _naive_iso(holdout["time"].iloc[0]),
+        "last": _naive_iso(bars["time"].iloc[-1]),
+        "holdout_bars": len(holdout),
+    }
+
+
+def _split_by_record(
+    bars: pd.DataFrame, rec: dict
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame] | None:
+    """Re-cut freshly downloaded bars at a resumed timeframe's recorded
+    boundaries: (bars, breed, select, holdout), or None when the data can no
+    longer reproduce them (a re-split by fraction could move the holdout onto
+    bars the finalists were selected on)."""
+    times = pd.to_datetime(bars["time"])
+    if times.dt.tz is not None:
+        times = times.dt.tz_localize(None)
+    t = times.to_numpy()
+    select_start = pd.Timestamp(rec["select_start"]).to_datetime64()
+    holdout_start = pd.Timestamp(rec["holdout_start"]).to_datetime64()
+    last = pd.Timestamp(rec["last"]).to_datetime64()
+    if len(t) == 0 or t[0] >= select_start or t[-1] < last:
+        return None
+    keep = t <= last
+    cut = bars[keep].reset_index(drop=True)
+    t = t[keep]
+    breed = cut[t < select_start].reset_index(drop=True)
+    select = cut[(t >= select_start) & (t < holdout_start)].reset_index(drop=True)
+    holdout = cut[t >= holdout_start].reset_index(drop=True)
+    if len(select) == 0 or len(holdout) < int(rec["holdout_bars"]):
+        return None
+    return cut, breed, select, holdout
+
+
 def _window(symbol: str, timeframe: str, holdout: pd.DataFrame, source: str) -> dict:
     return {
         "symbol": symbol,
@@ -268,6 +305,7 @@ def _holdout_stage(
     finalists: list[Finalist],
     tf_data: dict[str, _TfData],
     campaign_windows: list[dict],
+    changed: frozenset[str] = frozenset(),
 ) -> int:
     """Judge every finalist of one market once on its holdout; vault the best.
 
@@ -281,9 +319,11 @@ def _holdout_stage(
     """
     # A resumed market whose already-bred timeframe no longer loads has no
     # holdout slice for that timeframe's finalists: skip them, loudly.
+    # (Timeframes whose data changed were already logged when loaded.)
     missing = [
         tf for tf in cfg.timeframes
-        if tf not in tf_data and any(f.timeframe == tf for f in finalists)
+        if tf not in tf_data and tf not in changed
+        and any(f.timeframe == tf for f in finalists)
     ]
     for tf in missing:
         emit({"type": "log", "line": f"{symbol} {tf}: holdout skipped — no data"})
@@ -409,6 +449,8 @@ def run_campaign(
     resuming = resume_campaign_id is not None
     position: dict = {}
     finalists_ckpt: dict[str, list[dict]] = {}
+    # per symbol, per timeframe: the split boundaries it was bred under
+    splits_ckpt: dict[str, dict[str, dict]] = {}
     holdout_done: list[str] = []
     campaign_windows: list[dict] = []
     if resuming:
@@ -423,6 +465,7 @@ def run_campaign(
         units_done = int(ckpt.get("units_done", 0))
         position = {k: ckpt.get(k) for k in ("symbol", "timeframe", "tribe", "gen", "population")}
         finalists_ckpt = dict(ckpt.get("finalists") or {})
+        splits_ckpt = dict(ckpt.get("splits") or {})
         holdout_done = list(ckpt.get("holdout_done") or [])
         campaign_windows = json.loads(row.get("holdout_windows_json") or "[]")
         ck_sym = ckpt.get("symbol")
@@ -451,6 +494,7 @@ def run_campaign(
                     "vaulted_total": vaulted_total,
                     **position,
                     "finalists": finalists_ckpt,
+                    "splits": splits_ckpt,
                     "holdout_done": holdout_done,
                 }
             ),
@@ -513,7 +557,11 @@ def run_campaign(
                     f = Finalist.from_json(d)
                     market.setdefault(f.key, f)
             finalists_ckpt[symbol] = [f.to_json() for f in market.values()]
+            if not resumed_market:
+                splits_ckpt.pop(symbol, None)
+            market_splits = splits_ckpt.setdefault(symbol, {})
             tf_data: dict[str, _TfData] = {}
+            changed: set[str] = set()
 
             def unbred(tf_idx: int) -> int:
                 """Generation units of this timeframe not yet in units_done."""
@@ -546,9 +594,22 @@ def run_campaign(
                     )
                     units_done += sum(unbred(i) for i in range(tf_idx, len(cfg.timeframes)))
                     break
-                bars_breed, bars_select, bars_holdout = split_bars(
-                    bars, cfg.select_fraction, cfg.holdout_fraction
-                )
+                rec = market_splits.get(timeframe)
+                if rec is not None:
+                    # resumed: cut at the recorded boundaries, never re-split
+                    parts = _split_by_record(bars, rec)
+                    if parts is None:
+                        emit({"type": "log", "line": f"{symbol} {timeframe}: holdout skipped "
+                              "— data changed since breeding"})
+                        changed.add(timeframe)
+                        units_done += unbred(tf_idx)
+                        continue
+                    bars, bars_breed, bars_select, bars_holdout = parts
+                else:
+                    bars_breed, bars_select, bars_holdout = split_bars(
+                        bars, cfg.select_fraction, cfg.holdout_fraction
+                    )
+                    market_splits[timeframe] = _split_record(bars, bars_select, bars_holdout)
                 tf_data[timeframe] = _TfData(bars, bars_select, bars_holdout, costs)
                 emit(
                     {
@@ -660,9 +721,11 @@ def run_campaign(
             vaulted_total += _holdout_stage(
                 cfg, vault, emit, campaign_id, symbol,
                 list(market.values()), tf_data, campaign_windows,
+                changed=frozenset(changed),
             )
             holdout_done.append(symbol)
             finalists_ckpt.pop(symbol, None)  # judged: nothing left to resume
+            splits_ckpt.pop(symbol, None)
             persist()
     except _Cancelled:
         status, error = "cancelled", None
